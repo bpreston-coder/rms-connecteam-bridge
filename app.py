@@ -356,7 +356,22 @@ async def debug_job(code: str, token: str | None = None):
         resp = client.get(
             f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
             headers={"X-API-KEY": CONNECTEAM_API_KEY},
-            params={"jobCodes": code, "instanceIds": CONNECTEAM_SCHEDULER_ID},
+            params={"jobCodes": code, "includeDeleted": "true", "limit": 500},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+@app.get("/debug/jobs-all")
+async def debug_jobs_all(token: str | None = None):
+    """Temporary diagnostic route: list all jobs, no filter. Remove after verifying."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+    with httpx.Client(timeout=30) as client:
+        resp = client.get(
+            f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+            headers={"X-API-KEY": CONNECTEAM_API_KEY},
+            params={"includeDeleted": "true", "limit": 500},
         )
         resp.raise_for_status()
         return resp.json()
