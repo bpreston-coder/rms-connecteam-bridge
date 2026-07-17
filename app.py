@@ -719,7 +719,7 @@ async def debug_delete_shifts(ids: str, token: str | None = None):
                 resp = client.delete(
                     f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
                     headers=headers,
-                    params={"shiftIds": ",".join(chunk)},
+                    params={"shiftIds": chunk},
                 )
                 resp.raise_for_status()
                 deleted.extend(resp.json().get("data", {}).get("deletedShiftIds", []))
