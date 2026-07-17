@@ -718,16 +718,20 @@ async def debug_delete_shifts(ids: str, token: str | None = None):
     def _run() -> dict[str, Any]:
         headers = {"X-API-KEY": CONNECTEAM_API_KEY}
         deleted: list[str] = []
+        errors: list[dict[str, Any]] = []
         with httpx.Client(timeout=30) as client:
             for i in range(0, len(id_list), 20):
                 chunk = id_list[i : i + 20]
-                resp = client.delete(
+                resp = client.request(
+                    "DELETE",
                     f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
                     headers=headers,
                     params={"shiftIds": chunk},
                 )
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    errors.append({"status": resp.status_code, "body": resp.text[:1000], "chunk": chunk})
+                    continue
                 deleted.extend(resp.json().get("data", {}).get("deletedShiftIds", []))
-        return {"deleted_count": len(deleted), "deleted": deleted}
+        return {"deleted_count": len(deleted), "deleted": deleted, "errors": errors}
 
     return await asyncio.to_thread(_run)
