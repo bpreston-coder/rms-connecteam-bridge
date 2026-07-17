@@ -1,34 +1,45 @@
 """
 Current RMS -> Connecteam draft shift bridge.
 
-When a Current RMS opportunity is converted to an order, this service:
-  1. Receives the `opportunity_convert_to_order` webhook from Current RMS.
-  2. Looks up (or creates) a Connecteam Job for the order, with the Current
-     RMS order number in the Job's "Job No." (code) field and the order's
-     venue address in the Job's address field.
-  3. Fetches the order's Service line items (item_type == "Service") which
-     carry a title (name) and a start/end time.
-  4. Creates one DRAFT shift per service in Connecteam, titled
-     "<Opportunity subject> — <Service name>", linked to that Job (so it
-     carries the Job No. and address), using the service's start/end time.
+When a Current RMS opportunity is converted to an order, and whenever its
+Service line items are later edited, this service keeps Connecteam in sync:
+
+  1. A webhook fires instantly on `opportunity_convert_to_order`.
+  2. A background poll (every POLL_INTERVAL_SECONDS, default 15 minutes)
+     scans every opportunity in "Order" state that's been updated since the
+     last poll, so later edits to a Service item's dates/name are picked up
+     even though Current RMS has no "opportunity updated" webhook.
+
+Both paths funnel into the same idempotent sync routine, keyed off each
+Current RMS opportunity_item's ID:
+  - First time we see an item -> CREATE a draft Connecteam shift for it.
+  - If we've already created a shift for that item -> UPDATE that same
+    shift in place if the title/time/job changed, otherwise do nothing.
+This guarantees we never create duplicate shifts, no matter how many times
+an order is processed (webhook retries, overlapping polls, re-conversions).
+
+It also finds or creates a Connecteam Job per order, with the Current RMS
+order number in the Job's "Job No." (code) field and the order's venue
+address in the Job's address field, and keeps the address in sync too.
 
 See README.md for setup instructions.
 """
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import hmac
 import json
 import logging
 import os
+import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -46,37 +57,56 @@ CONNECTEAM_API_KEY = os.environ["CONNECTEAM_API_KEY"]
 CONNECTEAM_SCHEDULER_ID = os.environ["CONNECTEAM_SCHEDULER_ID"]
 CONNECTEAM_BASE_URL = os.environ.get("CONNECTEAM_BASE_URL", "https://api.connecteam.com")
 
-# Shared secret appended to the webhook target URL as ?token=... to stop
-# randoms on the internet from POSTing fake "convert to order" events at us.
-# Current RMS webhooks have no signing, so this query-string token is the
-# only gate — keep the URL itself private too.
+# Shared secret appended to protected URLs as ?token=... . Current RMS
+# webhooks aren't signed, so this query-string token is the gate for the
+# webhook endpoint — it's also required for /sync so randoms can't trigger
+# an unscheduled full sync. Keep the URL itself private too.
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 
-# Where we remember which opportunities we've already pushed, so Current
-# RMS's webhook retries (it retries failed deliveries for ~13 hours) don't
-# create duplicate shifts.
+# Where we remember: (a) which Connecteam shift belongs to which Current RMS
+# opportunity_item (so we UPDATE instead of duplicating), and (b) how far
+# back the last poll checked, so the next poll only looks at what changed.
 STATE_FILE = Path(os.environ.get("STATE_FILE", "./processed_orders.json"))
 
 MAX_SHIFT_SECONDS = 24 * 60 * 60  # Connecteam: a shift can't exceed 24h.
 
+# Background poll: catches Service-item edits made *after* conversion (no
+# Current RMS webhook fires for those). Runs every POLL_INTERVAL_SECONDS.
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", 15 * 60))
+# On the very first poll (no cursor yet), look back this far to catch any
+# orders converted before the service came online.
+POLL_INITIAL_LOOKBACK_HOURS = int(os.environ.get("POLL_INITIAL_LOOKBACK_HOURS", 24))
+# Overlap subtracted from "now" when saving the cursor, so a poll that took
+# a while to run doesn't create a gap that skips an edit made mid-poll.
+POLL_OVERLAP_MINUTES = 5
+ENABLE_SCHEDULER = os.environ.get("ENABLE_SCHEDULER", "true").lower() == "true"
+
 app = FastAPI(title="Current RMS -> Connecteam bridge")
 
+# Serializes all sync work (webhook hits and the background poll can
+# otherwise race on the same state file / same opportunity).
+sync_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
-# Small persistent "already processed" set
+# Small persistent state: shift tracking + poll cursor
 # ---------------------------------------------------------------------------
 
-def _load_processed() -> set[int]:
+def _load_state() -> dict[str, Any]:
     if STATE_FILE.exists():
         try:
-            return set(json.loads(STATE_FILE.read_text()))
+            data = json.loads(STATE_FILE.read_text())
+            data.setdefault("shifts", {})
+            data.setdefault("jobs", {})
+            data.setdefault("poll_cursor", None)
+            return data
         except (json.JSONDecodeError, OSError):
             log.warning("Could not read state file %s, starting fresh", STATE_FILE)
-    return set()
+    return {"shifts": {}, "jobs": {}, "poll_cursor": None}
 
 
-def _save_processed(ids: set[int]) -> None:
-    STATE_FILE.write_text(json.dumps(sorted(ids)))
+def _save_state(state: dict[str, Any]) -> None:
+    STATE_FILE.write_text(json.dumps(state))
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +128,34 @@ def fetch_opportunity(client: httpx.Client, opportunity_id: int) -> dict[str, An
     )
     resp.raise_for_status()
     return resp.json()["opportunity"]
+
+
+def fetch_orders_updated_since(client: httpx.Client, since_iso: str) -> list[int]:
+    """Return IDs of every opportunity in 'Order' state (state == 3) that's
+    been updated since since_iso. Used by the background poll to catch
+    Service-item edits made after conversion."""
+    ids: list[int] = []
+    page = 1
+    while True:
+        resp = client.get(
+            f"{CURRENT_RMS_BASE_URL}/api/v1/opportunities",
+            headers=rms_headers(),
+            params={
+                "q[state_eq]": 3,
+                "q[updated_at_gteq]": since_iso,
+                "per_page": 100,
+                "page": page,
+                "sort": "-updated_at",
+            },
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        ids.extend(o["id"] for o in body["opportunities"])
+        meta = body.get("meta", {})
+        if page * meta.get("per_page", 100) >= meta.get("total_row_count", 0):
+            break
+        page += 1
+    return ids
 
 
 def fetch_venue_address(client: httpx.Client, opportunity: dict[str, Any]) -> str | None:
@@ -163,19 +221,44 @@ def _to_epoch_seconds(iso_ts: str) -> int:
     return int(dt.astimezone(timezone.utc).timestamp())
 
 
-def find_or_create_job(client: httpx.Client, opportunity: dict[str, Any], address: str | None) -> str | None:
+def find_or_create_job(
+    client: httpx.Client, opportunity: dict[str, Any], address: str | None, jobs_state: dict[str, Any]
+) -> str | None:
     """Find (by Job No. / code) or create the Connecteam Job for this order,
     so its "Job No." box holds the Current RMS order number and its address
-    field holds the venue address. Returns the Connecteam jobId, or None if
-    the order has no number to key off of."""
+    field holds the venue address. Keeps the address in sync on later calls.
+    Returns the Connecteam jobId, or None if the order has no number to key
+    off of."""
     number = opportunity.get("number")
     if not number:
         return None
 
     headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
+    subject = opportunity.get("subject") or f"Order {number}"
+    title = f"{subject} ({number})"
 
-    # Look for an existing job with this Job No. first, so re-runs (retries,
-    # re-processing) don't create duplicate jobs.
+    cached = jobs_state.get(number)
+    if cached:
+        job_id = cached["jobId"]
+        if cached.get("address") != address:
+            resp = client.put(
+                f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs/{job_id}",
+                headers=headers,
+                json={
+                    "title": cached.get("title", title),
+                    "code": number,
+                    "assign": {"type": "both", "userIds": [], "groupIds": []},
+                    "gps": {"address": address} if address else None,
+                },
+            )
+            if resp.status_code >= 400:
+                log.error("Connecteam rejected job address update: %s %s", resp.status_code, resp.text)
+                resp.raise_for_status()
+            cached["address"] = address
+        return job_id
+
+    # Not cached locally — look for an existing job with this Job No. before
+    # creating, so a state-file reset doesn't produce duplicate jobs.
     resp = client.get(
         f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
         headers=headers,
@@ -184,12 +267,13 @@ def find_or_create_job(client: httpx.Client, opportunity: dict[str, Any], addres
     resp.raise_for_status()
     existing = resp.json().get("data", {}).get("jobs", [])
     if existing:
-        return existing[0]["jobId"]
+        job = existing[0]
+        jobs_state[number] = {"jobId": job["jobId"], "title": job.get("title", title), "address": address}
+        return job["jobId"]
 
-    subject = opportunity.get("subject") or f"Order {number}"
     job_payload: dict[str, Any] = {
         "instanceIds": [int(CONNECTEAM_SCHEDULER_ID)],
-        "title": f"{subject} ({number})",
+        "title": title,
         "code": number,
         "assign": {"type": "both", "userIds": [], "groupIds": []},
     }
@@ -204,15 +288,72 @@ def find_or_create_job(client: httpx.Client, opportunity: dict[str, Any], addres
     if resp.status_code >= 400:
         log.error("Connecteam rejected job creation: %s %s", resp.status_code, resp.text)
         resp.raise_for_status()
-    return resp.json()["data"]["jobs"][0]["jobId"]
+    job_id = resp.json()["data"]["jobs"][0]["jobId"]
+    jobs_state[number] = {"jobId": job_id, "title": title, "address": address}
+    return job_id
 
 
-def build_draft_shifts(
-    opportunity: dict[str, Any], services: list[dict[str, Any]], job_id: str | None
-) -> list[dict[str, Any]]:
+def create_shifts(client: httpx.Client, payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not payloads:
+        return []
+    url = f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts"
+    headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
+    created: list[dict[str, Any]] = []
+    for i in range(0, len(payloads), 500):
+        chunk = payloads[i : i + 500]
+        resp = client.post(url, headers=headers, json=chunk, params={"notifyUsers": "false"})
+        if resp.status_code >= 400:
+            log.error("Connecteam rejected shift creation: %s %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+        created.extend(resp.json().get("data", {}).get("shifts", []))
+    return created
+
+
+def update_shifts(client: httpx.Client, payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not payloads:
+        return []
+    url = f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts"
+    headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
+    updated: list[dict[str, Any]] = []
+    for i in range(0, len(payloads), 500):
+        chunk = payloads[i : i + 500]
+        resp = client.put(url, headers=headers, json=chunk, params={"notifyUsers": "false"})
+        if resp.status_code >= 400:
+            log.error("Connecteam rejected shift update: %s %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+        updated.extend(resp.json().get("data", {}).get("shifts", []))
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Core sync — idempotent, keyed off Current RMS opportunity_item IDs
+# ---------------------------------------------------------------------------
+
+def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str, Any]) -> dict[str, Any]:
+    """Create/update draft Connecteam shifts for one order, and its linked
+    Job. Mutates `state` in place; caller is responsible for persisting it.
+    Safe to call repeatedly for the same opportunity — matches existing
+    shifts by opportunity_item ID and only sends an update when something
+    actually changed."""
+    opportunity = fetch_opportunity(client, opportunity_id)
+
+    if opportunity.get("state_name") != "Order":
+        return {"status": "skipped", "reason": f"opportunity state is '{opportunity.get('state_name')}', not 'Order'"}
+
+    services = fetch_service_items(client, opportunity_id)
+    if not services:
+        return {"status": "skipped", "reason": "no dated Service line items found"}
+
+    address = fetch_venue_address(client, opportunity)
+    job_id = find_or_create_job(client, opportunity, address, state["jobs"])
+
     subject = opportunity.get("subject") or f"Order {opportunity.get('number', opportunity['id'])}"
-    shifts = []
-    skipped = []
+    shifts_state: dict[str, Any] = state["shifts"]
+
+    to_create: list[tuple[str, dict[str, Any], dict[str, Any]]] = []  # (key, payload, desired)
+    to_update: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    unchanged = 0
+    skipped: list[tuple[str, str]] = []
 
     for service in services:
         start = _to_epoch_seconds(service["starts_at"])
@@ -225,82 +366,130 @@ def build_draft_shifts(
             skipped.append((service["name"], "duration exceeds Connecteam's 24h shift limit"))
             continue
 
-        shift: dict[str, Any] = {
-            "startTime": start,
-            "endTime": end,
-            "title": f"{subject} — {service['name']}",
-            "isPublished": False,  # draft shift
-            "notes": [
-                {
-                    "html": (
-                        f"<p>Auto-created from Current RMS order "
-                        f"{opportunity.get('number', opportunity['id'])} "
-                        f"(opportunity item #{service['id']}).</p>"
-                    )
-                }
-            ],
-        }
-        if job_id:
-            # Link to the Job so the shift carries its Job No. and address.
-            shift["jobId"] = job_id
-            shift["locationData"] = {"isReferencedToJob": True}
-        shifts.append(shift)
+        title = f"{subject} — {service['name']}"
+        key = str(service["id"])
+        desired = {"startTime": start, "endTime": end, "title": title, "jobId": job_id}
+
+        existing = shifts_state.get(key)
+        if existing is None:
+            payload: dict[str, Any] = {
+                "startTime": start,
+                "endTime": end,
+                "title": title,
+                "isPublished": False,
+                "notes": [
+                    {
+                        "html": (
+                            f"<p>Auto-created from Current RMS order "
+                            f"{opportunity.get('number', opportunity['id'])} "
+                            f"(opportunity item #{service['id']}).</p>"
+                        )
+                    }
+                ],
+            }
+            if job_id:
+                payload["jobId"] = job_id
+                payload["locationData"] = {"isReferencedToJob": True}
+            to_create.append((key, payload, desired))
+        elif (
+            existing.get("startTime") != start
+            or existing.get("endTime") != end
+            or existing.get("title") != title
+            or existing.get("jobId") != job_id
+        ):
+            update_payload: dict[str, Any] = {
+                "shiftId": existing["shiftId"],
+                "startTime": start,
+                "endTime": end,
+                "title": title,
+            }
+            if job_id and existing.get("jobId") != job_id:
+                update_payload["jobId"] = job_id
+                update_payload["locationData"] = {"isReferencedToJob": True}
+            to_update.append((key, update_payload, desired))
+        else:
+            unchanged += 1
 
     if skipped:
         for name, reason in skipped:
             log.warning("Skipped service '%s': %s", name, reason)
 
-    return shifts
+    created_shifts = create_shifts(client, [p for _, p, _ in to_create])
+    if len(created_shifts) != len(to_create):
+        log.warning(
+            "Created %d shifts but requested %d for opportunity %s — response ordering assumption may be wrong",
+            len(created_shifts), len(to_create), opportunity_id,
+        )
+    for (key, _, desired), shift_obj in zip(to_create, created_shifts):
+        shifts_state[key] = {"shiftId": shift_obj["id"], **desired}
+
+    updated_shifts = update_shifts(client, [p for _, p, _ in to_update])
+    for key, _, desired in to_update:
+        existing = shifts_state.get(key, {})
+        existing.update(desired)
+        shifts_state[key] = existing
+
+    return {
+        "status": "ok",
+        "created_count": len(created_shifts),
+        "updated_count": len(updated_shifts),
+        "unchanged_count": unchanged,
+        "skipped_count": len(skipped),
+    }
 
 
-def push_draft_shifts(client: httpx.Client, shifts: list[dict[str, Any]]) -> dict[str, Any]:
-    url = f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts"
-    headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
+def poll_all_open_orders() -> dict[str, Any]:
+    """Background/manual poll: sync every Order-state opportunity updated
+    since the last poll, so Service-item edits made after conversion (which
+    fire no webhook) still reach Connecteam."""
+    with sync_lock:
+        state = _load_state()
+        poll_start = datetime.now(timezone.utc)
+        cursor = state.get("poll_cursor")
+        since = cursor or (poll_start - timedelta(hours=POLL_INITIAL_LOOKBACK_HOURS)).isoformat()
 
-    created: list[Any] = []
-    # Connecteam accepts up to 500 shifts per call; chunk defensively.
-    for i in range(0, len(shifts), 500):
-        chunk = shifts[i : i + 500]
-        resp = client.post(url, headers=headers, json=chunk, params={"notifyUsers": "false"})
-        if resp.status_code >= 400:
-            log.error("Connecteam rejected shift batch: %s %s", resp.status_code, resp.text)
-            resp.raise_for_status()
-        created.extend(resp.json().get("data", {}).get("shifts", []))
+        results: dict[str, Any] = {}
+        with httpx.Client(timeout=30) as client:
+            opportunity_ids = fetch_orders_updated_since(client, since)
+            for opportunity_id in opportunity_ids:
+                try:
+                    results[str(opportunity_id)] = sync_opportunity(client, opportunity_id, state)
+                except httpx.HTTPStatusError as exc:
+                    log.exception("Poll failed for opportunity %s", opportunity_id)
+                    results[str(opportunity_id)] = {
+                        "status": "error",
+                        "detail": f"{exc.response.status_code} {exc.response.text[:300]}",
+                    }
 
-    return {"created_count": len(created), "shifts": created}
+        state["poll_cursor"] = (poll_start - timedelta(minutes=POLL_OVERLAP_MINUTES)).isoformat()
+        _save_state(state)
+
+    log.info("Poll checked %d opportunit(y/ies): %s", len(results), results)
+    return {"checked": len(results), "since": since, "results": results}
+
+
+def _scheduler_loop() -> None:
+    # Give the app a moment to finish starting before the first poll.
+    time.sleep(10)
+    while True:
+        try:
+            poll_all_open_orders()
+        except Exception:
+            log.exception("Scheduled poll crashed")
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+def start_scheduler() -> None:
+    if ENABLE_SCHEDULER:
+        threading.Thread(target=_scheduler_loop, daemon=True).start()
+        log.info("Background poll scheduler started (every %ds)", POLL_INTERVAL_SECONDS)
+    else:
+        log.info("Background poll scheduler disabled (ENABLE_SCHEDULER=false)")
 
 
 # ---------------------------------------------------------------------------
-# Core processing
-# ---------------------------------------------------------------------------
-
-def process_opportunity(opportunity_id: int) -> dict[str, Any]:
-    with httpx.Client(timeout=30) as client:
-        opportunity = fetch_opportunity(client, opportunity_id)
-
-        if opportunity.get("state_name") != "Order":
-            return {
-                "status": "skipped",
-                "reason": f"opportunity state is '{opportunity.get('state_name')}', not 'Order'",
-            }
-
-        services = fetch_service_items(client, opportunity_id)
-        if not services:
-            return {"status": "skipped", "reason": "no dated Service line items found"}
-
-        address = fetch_venue_address(client, opportunity)
-        job_id = find_or_create_job(client, opportunity, address)
-
-        shifts = build_draft_shifts(opportunity, services, job_id)
-        if not shifts:
-            return {"status": "skipped", "reason": "all service items were skipped (see logs)"}
-
-        result = push_draft_shifts(client, shifts)
-        return {"status": "ok", **result}
-
-
-# ---------------------------------------------------------------------------
-# Webhook endpoint
+# Webhook endpoint (instant trigger on conversion)
 # ---------------------------------------------------------------------------
 
 @app.post("/webhooks/current-rms/opportunity-converted")
@@ -311,7 +500,6 @@ async def opportunity_converted(request: Request, token: str | None = None):
     payload = await request.json()
     action = payload.get("action", {})
 
-    # Current RMS convert_to_order fires with subject_type "Opportunity".
     if action.get("subject_type") != "Opportunity":
         return JSONResponse({"status": "ignored", "reason": "not an Opportunity action"})
 
@@ -319,13 +507,16 @@ async def opportunity_converted(request: Request, token: str | None = None):
     if opportunity_id is None:
         raise HTTPException(status_code=400, detail="action.subject_id missing")
 
-    processed = _load_processed()
-    if opportunity_id in processed:
-        log.info("Opportunity %s already processed, skipping duplicate webhook", opportunity_id)
-        return JSONResponse({"status": "skipped", "reason": "already processed"})
+    def _run() -> dict[str, Any]:
+        with sync_lock:
+            state = _load_state()
+            with httpx.Client(timeout=30) as client:
+                result = sync_opportunity(client, opportunity_id, state)
+            _save_state(state)
+            return result
 
     try:
-        result = process_opportunity(opportunity_id)
+        result = await asyncio.to_thread(_run)
     except httpx.HTTPStatusError as exc:
         log.exception("Upstream API error while processing opportunity %s", opportunity_id)
         raise HTTPException(
@@ -333,16 +524,24 @@ async def opportunity_converted(request: Request, token: str | None = None):
             detail=f"upstream error: {exc.response.status_code} {exc.response.text[:500]}",
         ) from exc
 
-    if result["status"] == "ok":
-        processed.add(opportunity_id)
-        _save_processed(processed)
-
-    log.info("Processed opportunity %s: %s", opportunity_id, result)
+    log.info("Webhook processed opportunity %s: %s", opportunity_id, result)
     return JSONResponse({"opportunity_id": opportunity_id, **result})
+
+
+# ---------------------------------------------------------------------------
+# Manual/scheduled sync trigger + health check
+# ---------------------------------------------------------------------------
+
+@app.get("/sync")
+async def manual_sync(token: str | None = None):
+    """Trigger a poll on demand (also runs automatically every
+    POLL_INTERVAL_SECONDS). Protected by WEBHOOK_TOKEN."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+    result = await asyncio.to_thread(poll_all_open_orders)
+    return JSONResponse(result)
 
 
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
-
-

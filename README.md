@@ -2,24 +2,56 @@
 
 When a Current RMS opportunity is **converted to an order**, this service automatically
 creates one **draft shift** in Connecteam for each dated Service line item on that order —
-titled `<Opportunity name> — <Service name>`, using the service's start/end time.
+titled `<Opportunity name> — <Service name>`, using the service's start/end time, and linked
+to a Connecteam **Job** that carries the Current RMS order number (in the Job's "Job No." /
+code field) and the order's venue address.
+
+If a Service item's name or times are edited *after* the order was converted, the matching
+Connecteam shift is updated in place on the next sync — it's never duplicated.
 
 Draft shifts are not published or assigned to anyone; they just appear in the Connecteam
 scheduler for your team to review, assign, and publish.
 
 ## How it works
 
-1. Current RMS fires an `opportunity_convert_to_order` webhook to this app whenever a
-   quotation is converted to an order.
-2. The app fetches the order and its line items, and keeps only the ones where
+1. Current RMS fires an `opportunity_convert_to_order` webhook to this app the moment a
+   quotation is converted to an order, for an instant first sync.
+2. A background poll also runs every 15 minutes (`POLL_INTERVAL_SECONDS`), checking every
+   order updated since the last poll. This is what catches Service-item edits made *after*
+   conversion — Current RMS has no "opportunity updated" webhook, so polling is the only way
+   to notice those changes. You can also trigger a poll on demand: `GET /sync?token=...`.
+3. Either path fetches the order's line items and keeps only the ones where
    `item_type == "Service"` and both a start and end time are set (e.g. "TRANSPORT - TRUCK
-   UP TO 9T - DELIVERY", "Rigger call", etc. — anything you've priced as a Service in Current
-   RMS with dates on it). Group/header rows and rental products are ignored.
-3. For each of those, it POSTs a draft shift to Connecteam:
-   `title = "<opportunity subject> — <service name>"`, `startTime`/`endTime` from the
-   service's dates, `isPublished: false`.
-4. It remembers which opportunity IDs it has already processed (in `processed_orders.json`)
-   so Current RMS's automatic webhook retries don't create duplicate shifts.
+   UP TO 9T - DELIVERY", "Lighting technician", etc.). Group/header rows and rental products
+   are ignored.
+4. If the order has a venue set, the app looks up the venue's address via Current RMS's
+   member record.
+5. It finds or creates a Connecteam **Job** for the order: `code = <order number>` (this is
+   what fills the "Job No." box), `gps.address = <venue address>`, `title = "<opportunity
+   subject> (<order number>)"`. If the venue address later changes, the Job is updated in
+   place.
+6. **Idempotent shift sync, keyed by Current RMS opportunity_item ID:**
+   - First time an item is seen → a draft shift is **created** (`isPublished: false`),
+     linked to the Job above.
+   - If a shift already exists for that item → it's **updated in place** (same shift, new
+     title/time) only if something actually changed; otherwise nothing is sent.
+
+   This mapping is remembered in `processed_orders.json`, so no combination of webhook
+   retries, overlapping polls, or re-processing can ever create a duplicate shift for the
+   same line item.
+
+## Keeping the 15-minute poll running
+
+The background poll only fires while the app process is alive. Render's **free** web service
+tier spins down after ~15 minutes of no incoming HTTP traffic, which would silently stop the
+poll. Two ways to keep it reliable:
+
+- **Upgrade to a paid Render instance type** (e.g. Starter) so the service never sleeps —
+  the built-in scheduler then just runs continuously. This is what's configured for this
+  deployment.
+- Or, on the free tier, have something external hit `GET /sync?token=...` (or even just
+  `/healthz`) every 15 minutes — a Render Cron Job, or a free uptime-ping service — to both
+  wake the app and trigger the sync.
 
 ## Prerequisites
 
@@ -127,8 +159,16 @@ If nothing arrives, check:
   If you also want a shift per rental item, or want to key off a different set of item types,
   adjust the filter in `fetch_service_items()` in `app.py`.
 - **Retries and duplicates**: Current RMS retries a failed webhook delivery up to 6 times
-  over ~13 hours. `processed_orders.json` prevents duplicate shift creation on retry. If you
-  ever need to reprocess an order (e.g. after fixing a bug), remove its ID from that file.
-- **Re-conversions**: if an order is reverted to quotation and re-converted, it will be
-  treated as already processed and skipped. Delete its ID from `processed_orders.json` if you
-  want it to run again.
+  over ~13 hours, and the 15-minute poll may also pick up the same order — none of this
+  creates duplicates, since shifts are matched and updated by opportunity_item ID rather than
+  re-created.
+- **Reverted/re-converted orders**: if an order is reverted to quotation, its shifts are left
+  as-is in Connecteam (they're not deleted automatically). If it's later re-converted, any
+  Service items with the same IDs are updated, not duplicated.
+- **Removed Service items**: if a Service item is deleted from an order after its shift was
+  created, the shift is *not* automatically deleted from Connecteam — remove it manually if
+  needed.
+- **State file is per-deployment disk**: `processed_orders.json` lives on the web service's
+  local disk. A full redeploy wipes it, so the next sync after a redeploy may re-create shifts
+  it previously matched (it will fall back to Connecteam's own dedup where possible, e.g.
+  jobs are matched by Job No. even after a state reset, but shift-level matching is lost).
