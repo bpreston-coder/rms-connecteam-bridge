@@ -545,3 +545,147 @@ async def manual_sync(token: str | None = None):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
+
+
+# ---------------------------------------------------------------------------
+# TEMPORARY one-off recovery endpoints — remove after use.
+# Reconstructs state["shifts"]/state["jobs"] from what's actually live in
+# Connecteam (parsing the opportunity_item ID out of each shift's notes),
+# and reports any opportunity_item that has more than one shift (duplicates
+# created before this reconciliation existed). Dry-run by default.
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_ITEM_RE = _re.compile(r"opportunity item #(\d+)")
+
+
+@app.get("/debug/reconcile")
+async def debug_reconcile(token: str | None = None, apply: bool = False):
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        with httpx.Client(timeout=30) as client:
+            # All jobs -> keyed by code (Current RMS order number).
+            jobs_by_code: dict[str, Any] = {}
+            offset = 0
+            while True:
+                resp = client.get(
+                    f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+                    headers=headers,
+                    params={"instanceIds": CONNECTEAM_SCHEDULER_ID, "limit": 500, "offset": offset},
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                jobs = body.get("data", {}).get("jobs", [])
+                for j in jobs:
+                    if j.get("code"):
+                        jobs_by_code[j["code"]] = j
+                if len(jobs) < 500:
+                    break
+                offset = body.get("paging", {}).get("offset", offset + 500)
+
+            # All shifts in a wide window (5 years back/forward covers any
+            # realistic order date).
+            now = int(time.time())
+            shifts: list[dict[str, Any]] = []
+            offset = 0
+            while True:
+                resp = client.get(
+                    f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+                    headers=headers,
+                    params={
+                        "startTime": now - 5 * 365 * 86400,
+                        "endTime": now + 5 * 365 * 86400,
+                        "limit": 500,
+                        "offset": offset,
+                        "sort": "created_at",
+                        "order": "asc",
+                    },
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                batch = body.get("data", {}).get("shifts", [])
+                shifts.extend(batch)
+                if len(batch) < 500:
+                    break
+                offset = body.get("paging", {}).get("offset", offset + 500)
+
+        by_item: dict[str, list[dict[str, Any]]] = {}
+        for s in shifts:
+            note_text = " ".join(n.get("html", "") for n in s.get("notes", []))
+            m = _ITEM_RE.search(note_text)
+            if not m:
+                continue
+            by_item.setdefault(m.group(1), []).append(s)
+
+        new_shifts_state: dict[str, Any] = {}
+        duplicates: dict[str, list[str]] = {}
+        for item_id, group in by_item.items():
+            group.sort(key=lambda s: s.get("creationTime") or 0)
+            keeper = group[0]
+            new_shifts_state[item_id] = {
+                "shiftId": keeper["id"],
+                "startTime": keeper["startTime"],
+                "endTime": keeper["endTime"],
+                "title": keeper["title"],
+                "jobId": keeper.get("jobId"),
+            }
+            if len(group) > 1:
+                duplicates[item_id] = [s["id"] for s in group[1:]]
+
+        new_jobs_state: dict[str, Any] = {}
+        for code, j in jobs_by_code.items():
+            new_jobs_state[code] = {
+                "jobId": j["jobId"],
+                "title": j.get("title"),
+                "address": (j.get("gps") or {}).get("address"),
+            }
+
+        summary = {
+            "jobs_found": len(jobs_by_code),
+            "shifts_found": len(shifts),
+            "shifts_with_parsed_item_id": sum(len(g) for g in by_item.values()),
+            "unique_items": len(by_item),
+            "duplicate_groups": duplicates,
+            "duplicate_shift_count": sum(len(v) for v in duplicates.values()),
+            "applied": False,
+        }
+
+        if apply:
+            state = _load_state()
+            state["shifts"] = new_shifts_state
+            state["jobs"] = new_jobs_state
+            _save_state(state)
+            summary["applied"] = True
+
+        return summary
+
+    return await asyncio.to_thread(_run)
+
+
+@app.delete("/debug/shifts")
+async def debug_delete_shifts(ids: str, token: str | None = None):
+    """ids = comma-separated Connecteam shift IDs to permanently delete."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+    id_list = [i for i in ids.split(",") if i]
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        deleted: list[str] = []
+        with httpx.Client(timeout=30) as client:
+            for i in range(0, len(id_list), 20):
+                chunk = id_list[i : i + 20]
+                resp = client.delete(
+                    f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+                    headers=headers,
+                    params={"shiftIds": ",".join(chunk)},
+                )
+                resp.raise_for_status()
+                deleted.extend(resp.json().get("data", {}).get("deletedShiftIds", []))
+        return {"deleted_count": len(deleted), "deleted": deleted}
+
+    return await asyncio.to_thread(_run)
