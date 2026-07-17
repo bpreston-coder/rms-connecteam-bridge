@@ -666,6 +666,43 @@ async def debug_reconcile(token: str | None = None, apply: bool = False):
     return await asyncio.to_thread(_run)
 
 
+@app.get("/debug/shift-lookup")
+async def debug_shift_lookup(ids: str, token: str | None = None):
+    """ids = comma-separated Connecteam shift IDs. Returns title/time/notes
+    for each, so duplicates can be reviewed before deletion."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+    id_list = [i for i in ids.split(",") if i]
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        out = []
+        with httpx.Client(timeout=30) as client:
+            for sid in id_list:
+                resp = client.get(
+                    f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts/{sid}",
+                    headers=headers,
+                )
+                if resp.status_code == 404:
+                    out.append({"id": sid, "found": False})
+                    continue
+                resp.raise_for_status()
+                s = resp.json()["data"]
+                out.append({
+                    "id": sid,
+                    "found": True,
+                    "title": s.get("title"),
+                    "startTime": s.get("startTime"),
+                    "endTime": s.get("endTime"),
+                    "creationTime": s.get("creationTime"),
+                    "jobId": s.get("jobId"),
+                    "notes": [n.get("html") for n in s.get("notes", [])],
+                })
+        return {"shifts": out}
+
+    return await asyncio.to_thread(_run)
+
+
 @app.delete("/debug/shifts")
 async def debug_delete_shifts(ids: str, token: str | None = None):
     """ids = comma-separated Connecteam shift IDs to permanently delete."""
