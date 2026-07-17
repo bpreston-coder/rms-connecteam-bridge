@@ -262,3 +262,18 @@ async def opportunity_converted(request: Request, token: str | None = None):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
+
+
+@app.get("/debug/schedulers")
+async def debug_schedulers(token: str | None = None):
+    """Temporary diagnostic route: lists Connecteam schedulers so the correct
+    CONNECTEAM_SCHEDULER_ID can be identified. Remove once configured."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+    with httpx.Client(timeout=30) as client:
+        resp = client.get(
+            f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers",
+            headers={"X-API-KEY": CONNECTEAM_API_KEY},
+        )
+        resp.raise_for_status()
+        return resp.json()
