@@ -3,11 +3,14 @@ Current RMS -> Connecteam draft shift bridge.
 
 When a Current RMS opportunity is converted to an order, this service:
   1. Receives the `opportunity_convert_to_order` webhook from Current RMS.
-  2. Fetches the order's Service line items (item_type == "Service") which
+  2. Looks up (or creates) a Connecteam Job for the order, with the Current
+     RMS order number in the Job's "Job No." (code) field and the order's
+     venue address in the Job's address field.
+  3. Fetches the order's Service line items (item_type == "Service") which
      carry a title (name) and a start/end time.
-  3. Creates one DRAFT shift per service in Connecteam, titled
-     "<Opportunity subject> — <Service name>", using the service's
-     start/end time.
+  4. Creates one DRAFT shift per service in Connecteam, titled
+     "<Opportunity subject> — <Service name>", linked to that Job (so it
+     carries the Job No. and address), using the service's start/end time.
 
 See README.md for setup instructions.
 """
@@ -97,6 +100,33 @@ def fetch_opportunity(client: httpx.Client, opportunity_id: int) -> dict[str, An
     return resp.json()["opportunity"]
 
 
+def fetch_venue_address(client: httpx.Client, opportunity: dict[str, Any]) -> str | None:
+    """Return a formatted address string for the opportunity's venue, or
+    None if the opportunity has no venue set."""
+    venue_id = opportunity.get("venue_id")
+    if not venue_id:
+        return None
+
+    resp = client.get(
+        f"{CURRENT_RMS_BASE_URL}/api/v1/members/{venue_id}",
+        headers=rms_headers(),
+    )
+    resp.raise_for_status()
+    member = resp.json()["member"]
+    addr = member.get("primary_address")
+    if not addr:
+        return None
+
+    parts = [
+        addr.get("street"),
+        addr.get("city"),
+        addr.get("county"),
+        addr.get("postcode"),
+        addr.get("country_name"),
+    ]
+    return ", ".join(p for p in parts if p)
+
+
 def fetch_service_items(client: httpx.Client, opportunity_id: int) -> list[dict[str, Any]]:
     """Return opportunity_items where item_type == 'Service' and both
     starts_at/ends_at are populated (i.e. an actual scheduled service, not a
@@ -133,7 +163,53 @@ def _to_epoch_seconds(iso_ts: str) -> int:
     return int(dt.astimezone(timezone.utc).timestamp())
 
 
-def build_draft_shifts(opportunity: dict[str, Any], services: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def find_or_create_job(client: httpx.Client, opportunity: dict[str, Any], address: str | None) -> str | None:
+    """Find (by Job No. / code) or create the Connecteam Job for this order,
+    so its "Job No." box holds the Current RMS order number and its address
+    field holds the venue address. Returns the Connecteam jobId, or None if
+    the order has no number to key off of."""
+    number = opportunity.get("number")
+    if not number:
+        return None
+
+    headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
+
+    # Look for an existing job with this Job No. first, so re-runs (retries,
+    # re-processing) don't create duplicate jobs.
+    resp = client.get(
+        f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+        headers=headers,
+        params={"jobCodes": number, "instanceIds": CONNECTEAM_SCHEDULER_ID},
+    )
+    resp.raise_for_status()
+    existing = resp.json().get("data", {}).get("jobs", [])
+    if existing:
+        return existing[0]["jobId"]
+
+    subject = opportunity.get("subject") or f"Order {number}"
+    job_payload: dict[str, Any] = {
+        "instanceIds": [int(CONNECTEAM_SCHEDULER_ID)],
+        "title": f"{subject} ({number})",
+        "code": number,
+        "assign": {"type": "both", "userIds": [], "groupIds": []},
+    }
+    if address:
+        job_payload["gps"] = {"address": address}
+
+    resp = client.post(
+        f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+        headers=headers,
+        json=[job_payload],
+    )
+    if resp.status_code >= 400:
+        log.error("Connecteam rejected job creation: %s %s", resp.status_code, resp.text)
+        resp.raise_for_status()
+    return resp.json()["data"]["jobs"][0]["jobId"]
+
+
+def build_draft_shifts(
+    opportunity: dict[str, Any], services: list[dict[str, Any]], job_id: str | None
+) -> list[dict[str, Any]]:
     subject = opportunity.get("subject") or f"Order {opportunity.get('number', opportunity['id'])}"
     shifts = []
     skipped = []
@@ -149,23 +225,26 @@ def build_draft_shifts(opportunity: dict[str, Any], services: list[dict[str, Any
             skipped.append((service["name"], "duration exceeds Connecteam's 24h shift limit"))
             continue
 
-        shifts.append(
-            {
-                "startTime": start,
-                "endTime": end,
-                "title": f"{subject} — {service['name']}",
-                "isPublished": False,  # draft shift
-                "notes": [
-                    {
-                        "html": (
-                            f"<p>Auto-created from Current RMS order "
-                            f"{opportunity.get('number', opportunity['id'])} "
-                            f"(opportunity item #{service['id']}).</p>"
-                        )
-                    }
-                ],
-            }
-        )
+        shift: dict[str, Any] = {
+            "startTime": start,
+            "endTime": end,
+            "title": f"{subject} — {service['name']}",
+            "isPublished": False,  # draft shift
+            "notes": [
+                {
+                    "html": (
+                        f"<p>Auto-created from Current RMS order "
+                        f"{opportunity.get('number', opportunity['id'])} "
+                        f"(opportunity item #{service['id']}).</p>"
+                    )
+                }
+            ],
+        }
+        if job_id:
+            # Link to the Job so the shift carries its Job No. and address.
+            shift["jobId"] = job_id
+            shift["locationData"] = {"isReferencedToJob": True}
+        shifts.append(shift)
 
     if skipped:
         for name, reason in skipped:
@@ -209,7 +288,10 @@ def process_opportunity(opportunity_id: int) -> dict[str, Any]:
         if not services:
             return {"status": "skipped", "reason": "no dated Service line items found"}
 
-        shifts = build_draft_shifts(opportunity, services)
+        address = fetch_venue_address(client, opportunity)
+        job_id = find_or_create_job(client, opportunity, address)
+
+        shifts = build_draft_shifts(opportunity, services, job_id)
         if not shifts:
             return {"status": "skipped", "reason": "all service items were skipped (see logs)"}
 
@@ -262,3 +344,19 @@ async def opportunity_converted(request: Request, token: str | None = None):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
+
+
+@app.get("/debug/job")
+async def debug_job(code: str, token: str | None = None):
+    """Temporary diagnostic route: look up a Connecteam Job by its Job No.
+    (code) to verify it was created correctly. Remove after verifying."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+    with httpx.Client(timeout=30) as client:
+        resp = client.get(
+            f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+            headers={"X-API-KEY": CONNECTEAM_API_KEY},
+            params={"jobCodes": code, "instanceIds": CONNECTEAM_SCHEDULER_ID},
+        )
+        resp.raise_for_status()
+        return resp.json()
