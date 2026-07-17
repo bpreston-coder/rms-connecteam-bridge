@@ -644,6 +644,9 @@ async def debug_reconcile(token: str | None = None, apply: bool = False):
                 "address": (j.get("gps") or {}).get("address"),
             }
 
+        all_our_shift_ids = [s["id"] for group in by_item.values() for s in group]
+        all_our_job_ids = [j["jobId"] for j in jobs_by_code.values()]
+
         summary = {
             "jobs_found": len(jobs_by_code),
             "shifts_found": len(shifts),
@@ -651,6 +654,8 @@ async def debug_reconcile(token: str | None = None, apply: bool = False):
             "unique_items": len(by_item),
             "duplicate_groups": duplicates,
             "duplicate_shift_count": sum(len(v) for v in duplicates.values()),
+            "all_our_shift_ids": all_our_shift_ids,
+            "all_our_job_ids": all_our_job_ids,
             "applied": False,
         }
 
