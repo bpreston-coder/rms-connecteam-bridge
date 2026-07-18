@@ -879,6 +879,43 @@ async def debug_shift_custom_fields(token: str | None = None):
     return await asyncio.to_thread(_run)
 
 
+@app.get("/debug/shifts-raw-by-title-prefix")
+async def debug_shifts_raw_by_title_prefix(prefix: str, token: str | None = None):
+    """Read-only: return raw shift objects (full JSON) whose title starts
+    with `prefix`, via the public API, wide date window."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        now = int(time.time())
+        with httpx.Client(timeout=30) as client:
+            shifts: list[dict[str, Any]] = []
+            offset = 0
+            while True:
+                resp = client.get(
+                    f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+                    headers=headers,
+                    params={
+                        "startTime": now - 5 * 365 * 86400,
+                        "endTime": now + 5 * 365 * 86400,
+                        "limit": 500,
+                        "offset": offset,
+                    },
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                batch = body.get("data", {}).get("shifts", [])
+                shifts.extend(batch)
+                if len(batch) < 500:
+                    break
+                offset = body.get("paging", {}).get("offset", offset + 500)
+        matching = [s for s in shifts if (s.get("title") or "").startswith(prefix)]
+        return {"matched": len(matching), "shifts": matching}
+
+    return await asyncio.to_thread(_run)
+
+
 @app.post("/debug/test-open-shift")
 async def debug_test_open_shift(token: str | None = None, max_slots: int = 4):
     """One-off: create a draft shift via the public API with isOpenShift +
