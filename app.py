@@ -810,6 +810,9 @@ async def debug_shift_custom_fields(token: str | None = None):
             f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/custom-fields/shifts",
             f"{CONNECTEAM_BASE_URL}/scheduler/v1/custom-fields/shifts?schedulerId={CONNECTEAM_SCHEDULER_ID}",
             f"{CONNECTEAM_BASE_URL}/scheduler/v1/custom-fields/shifts",
+            f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shift-custom-fields",
+            f"{CONNECTEAM_BASE_URL}/scheduler/v1/shift-custom-fields?schedulerId={CONNECTEAM_SCHEDULER_ID}",
+            f"{CONNECTEAM_BASE_URL}/scheduler/v2/schedulers/{CONNECTEAM_SCHEDULER_ID}/custom-fields/shifts",
         ]
         results: dict[str, Any] = {}
         with httpx.Client(timeout=30) as client:
