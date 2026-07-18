@@ -1,26 +1,35 @@
 """
 Current RMS -> Connecteam draft shift bridge.
 
-When a Current RMS opportunity is converted to an order, and whenever its
-Service line items are later edited, this service keeps Connecteam in sync:
+An opportunity is eligible for draft shifts when it's in "Order" state
+(always), or in "Quotation" state with the "Draft shifts in Connecteam"
+Yes/No custom field ticked. Two paths keep Connecteam in sync:
 
-  1. A webhook fires instantly on `opportunity_convert_to_order`.
+  1. Webhooks fire instantly on opportunity_convert_to_order, opportunity_
+     update, opportunity_convert_to_quotation, opportunity_revert_to_
+     quotation, opportunity_mark_as_dead, and opportunity_mark_as_lost.
   2. A background poll (every POLL_INTERVAL_SECONDS, default 15 minutes)
-     scans every opportunity in "Order" state that's been updated since the
-     last poll, so later edits to a Service item's dates/name are picked up
-     even though Current RMS has no "opportunity updated" webhook.
+     scans every Order- or Quotation-state opportunity updated since the
+     last poll, so Service-item edits and eligibility changes are always
+     eventually picked up even if a webhook is missed.
 
 Both paths funnel into the same idempotent sync routine, keyed off each
 Current RMS opportunity_item's ID:
-  - First time we see an item -> CREATE a draft Connecteam shift for it.
+  - First time we see an item on an eligible opportunity -> CREATE a draft
+    Connecteam shift for it.
   - If we've already created a shift for that item -> UPDATE that same
-    shift in place if the title/time/job changed, otherwise do nothing.
+    shift in place if the title/time/job/quantity changed, otherwise do
+    nothing.
+  - If the opportunity is no longer eligible (flag unticked, or it went
+    dead/lost/reverted) -> DELETE any shifts we created that are still
+    draft; leave already-published shifts alone for manual review.
 This guarantees we never create duplicate shifts, no matter how many times
-an order is processed (webhook retries, overlapping polls, re-conversions).
+an opportunity is processed (webhook retries, overlapping polls, re-
+conversions), and never silently blow away a shift someone has published.
 
-It also finds or creates a Connecteam Job per order, with the Current RMS
-order number in the Job's "Job No." (code) field and the order's venue
-address in the Job's address field, and keeps the address in sync too.
+It also finds a Connecteam Job per Service line item (matched by service
+name, never created here), writes the Current RMS order number into the
+shift's "Job No." custom field, and the required headcount into "Qty Rqrd".
 
 See README.md for setup instructions.
 """
@@ -159,32 +168,58 @@ def fetch_opportunity(client: httpx.Client, opportunity_id: int) -> dict[str, An
     return resp.json()["opportunity"]
 
 
-def fetch_orders_updated_since(client: httpx.Client, since_iso: str) -> list[int]:
-    """Return IDs of every opportunity in 'Order' state (state == 3) that's
+#  2 = Quotation, 3 = Order (confirmed live against this account's data).
+CURRENT_RMS_STATE_ORDER = 3
+CURRENT_RMS_STATE_QUOTATION = 2
+
+
+def fetch_opportunities_updated_since(client: httpx.Client, since_iso: str) -> list[int]:
+    """Return IDs of every opportunity in 'Order' OR 'Quotation' state that's
     been updated since since_iso. Used by the background poll to catch
-    Service-item edits made after conversion."""
-    ids: list[int] = []
-    page = 1
-    while True:
-        resp = client.get(
-            f"{CURRENT_RMS_BASE_URL}/api/v1/opportunities",
-            headers=rms_headers(),
-            params={
-                "q[state_eq]": 3,
-                "q[updated_at_gteq]": since_iso,
-                "per_page": 100,
-                "page": page,
-                "sort": "-updated_at",
-            },
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        ids.extend(o["id"] for o in body["opportunities"])
-        meta = body.get("meta", {})
-        if page * meta.get("per_page", 100) >= meta.get("total_row_count", 0):
-            break
-        page += 1
-    return ids
+    Service-item edits made after conversion, and Quotation-state
+    opportunities that had "Draft shifts in Connecteam" ticked (or
+    unticked/gone dead/lost — sync_opportunity() decides eligibility and
+    handles cleanup either way)."""
+    ids: set[int] = set()
+    for state_id in (CURRENT_RMS_STATE_ORDER, CURRENT_RMS_STATE_QUOTATION):
+        page = 1
+        while True:
+            resp = client.get(
+                f"{CURRENT_RMS_BASE_URL}/api/v1/opportunities",
+                headers=rms_headers(),
+                params={
+                    "q[state_eq]": state_id,
+                    "q[updated_at_gteq]": since_iso,
+                    "per_page": 100,
+                    "page": page,
+                    "sort": "-updated_at",
+                },
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            ids.update(o["id"] for o in body["opportunities"])
+            meta = body.get("meta", {})
+            if page * meta.get("per_page", 100) >= meta.get("total_row_count", 0):
+                break
+            page += 1
+    return list(ids)
+
+
+def _is_eligible(opportunity: dict[str, Any]) -> tuple[bool, str]:
+    """Order state is always eligible (existing behavior). Quotation state is
+    eligible only when the "Draft shifts in Connecteam" Yes/No custom field
+    is ticked — Current RMS returns this as custom_fields.
+    draft_shifts_in_connecteams == "Yes" (exact string, confirmed live).
+    Everything else (Enquiry, dead, lost, etc.) is not eligible."""
+    state_name = opportunity.get("state_name")
+    if state_name == "Order":
+        return True, "order"
+    if state_name == "Quotation":
+        flag = (opportunity.get("custom_fields") or {}).get("draft_shifts_in_connecteams")
+        if (flag or "").strip().lower() == "yes":
+            return True, "quotation_flagged"
+        return False, "quotation_not_flagged"
+    return False, f"state '{state_name}' not eligible"
 
 
 def fetch_venue_address(client: httpx.Client, opportunity: dict[str, Any]) -> str | None:
@@ -344,6 +379,79 @@ def update_shifts(client: httpx.Client, payloads: list[dict[str, Any]]) -> list[
     return updated
 
 
+def get_shift(client: httpx.Client, shift_id: str) -> dict[str, Any] | None:
+    """Fetch a single shift; returns None if it no longer exists (e.g.
+    already deleted by hand in Connecteam)."""
+    headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+    resp = client.get(
+        f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts/{shift_id}",
+        headers=headers,
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()["data"]
+
+
+def delete_shift(client: httpx.Client, shift_id: str) -> None:
+    headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+    resp = client.request(
+        "DELETE",
+        f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts/{shift_id}",
+        headers=headers,
+    )
+    if resp.status_code >= 400 and resp.status_code != 404:
+        log.error("Connecteam rejected shift deletion %s: %s %s", shift_id, resp.status_code, resp.text)
+        resp.raise_for_status()
+
+
+def cleanup_ineligible_opportunity(
+    client: httpx.Client, opportunity_id: int, reason: str, state: dict[str, Any]
+) -> dict[str, Any]:
+    """An opportunity that used to be eligible (Order, or flagged Quotation)
+    no longer is — flag was unticked, or it went dead/lost/reverted.
+    Draft (unpublished) shifts we created for it are deleted automatically.
+    Published shifts are left alone — a human has already put real
+    scheduling work into a published shift, so this only deletes what's
+    still safely a draft. (Notifying ops about left-behind published shifts
+    is planned but not wired up yet.)"""
+    shifts_state: dict[str, Any] = state["shifts"]
+    keys = [k for k, v in shifts_state.items() if v.get("opportunityId") == opportunity_id]
+    if not keys:
+        return {"status": "skipped", "reason": reason, "tracked_shifts": 0}
+
+    deleted = 0
+    left_published = 0
+    already_gone = 0
+    for key in keys:
+        shift_id = shifts_state[key]["shiftId"]
+        shift = get_shift(client, shift_id)
+        if shift is None:
+            already_gone += 1
+            del shifts_state[key]
+            continue
+        if shift.get("isPublished"):
+            left_published += 1
+            log.warning(
+                "Opportunity %s is no longer eligible (%s) but shift %s is already published — "
+                "leaving it in place for manual review.",
+                opportunity_id, reason, shift_id,
+            )
+            continue
+        delete_shift(client, shift_id)
+        deleted += 1
+        del shifts_state[key]
+
+    return {
+        "status": "cleaned_up",
+        "reason": reason,
+        "tracked_shifts": len(keys),
+        "deleted_draft_count": deleted,
+        "left_published_count": left_published,
+        "already_gone_count": already_gone,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Core sync — idempotent, keyed off Current RMS opportunity_item IDs
 # ---------------------------------------------------------------------------
@@ -356,8 +464,10 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     actually changed."""
     opportunity = fetch_opportunity(client, opportunity_id)
 
-    if opportunity.get("state_name") != "Order":
-        return {"status": "skipped", "reason": f"opportunity state is '{opportunity.get('state_name')}', not 'Order'"}
+    eligible, reason = _is_eligible(opportunity)
+    if not eligible:
+        cleanup_result = cleanup_ineligible_opportunity(client, opportunity_id, reason, state)
+        return {"status": "skipped", "reason": reason, **cleanup_result}
 
     services = fetch_service_items(client, opportunity_id)
     if not services:
@@ -413,6 +523,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
 
         key = str(service["id"])
         desired = {
+            "opportunityId": opportunity_id,
             "startTime": start,
             "endTime": end,
             "title": title,
@@ -507,9 +618,11 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
 
 
 def poll_all_open_orders() -> dict[str, Any]:
-    """Background/manual poll: sync every Order-state opportunity updated
-    since the last poll, so Service-item edits made after conversion (which
-    fire no webhook) still reach Connecteam."""
+    """Background/manual poll: sync every Order- or Quotation-state
+    opportunity updated since the last poll, so Service-item edits made
+    after conversion, and flag-driven Quotation eligibility changes (ticked,
+    unticked, gone dead/lost), are picked up even outside the instant
+    webhook paths."""
     with sync_lock:
         state = _load_state()
         poll_start = datetime.now(timezone.utc)
@@ -518,7 +631,7 @@ def poll_all_open_orders() -> dict[str, Any]:
 
         results: dict[str, Any] = {}
         with httpx.Client(timeout=30) as client:
-            opportunity_ids = fetch_orders_updated_since(client, since)
+            opportunity_ids = fetch_opportunities_updated_since(client, since)
             for opportunity_id in opportunity_ids:
                 try:
                     results[str(opportunity_id)] = sync_opportunity(client, opportunity_id, state)
