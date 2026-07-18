@@ -380,7 +380,10 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         # ever goes into the shift title text, per the corrected design.
         job_id = find_job_by_service_name(client, service["name"], job_title_cache)
 
-        title = f"{subject} — {service['name']}"
+        # Shift title is just the opportunity name — the service/task type
+        # is already conveyed by the Job dropdown, so it doesn't need to be
+        # repeated in the title text.
+        title = subject
 
         # Current RMS line items with quantity > 1 become that many
         # separate draft shifts (e.g. "4 x Lighting Technician" -> 4
@@ -1078,6 +1081,57 @@ async def debug_create_test_jobs(token: str | None = None, prefix: str = "TEST "
             "skipped_already_existed": skipped,
             "errors": errors,
         }
+
+    return await asyncio.to_thread(_run)
+
+
+@app.delete("/debug/shifts-by-title-prefix")
+async def debug_delete_shifts_by_title_prefix(prefix: str, token: str | None = None):
+    """One-off cleanup: delete every shift in this scheduler whose title
+    starts with `prefix` (wide date window). Used to clear out scratch
+    shifts created by /debug/test-open-shift and similar."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        now = int(time.time())
+        with httpx.Client(timeout=30) as client:
+            shifts: list[dict[str, Any]] = []
+            offset = 0
+            while True:
+                resp = client.get(
+                    f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+                    headers=headers,
+                    params={
+                        "startTime": now - 5 * 365 * 86400,
+                        "endTime": now + 5 * 365 * 86400,
+                        "limit": 500,
+                        "offset": offset,
+                    },
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                batch = body.get("data", {}).get("shifts", [])
+                shifts.extend(batch)
+                if len(batch) < 500:
+                    break
+                offset = body.get("paging", {}).get("offset", offset + 500)
+
+            matching_ids = [s["id"] for s in shifts if (s.get("title") or "").startswith(prefix)]
+            deleted: list[str] = []
+            errors: list[dict[str, Any]] = []
+            for sid in matching_ids:
+                resp = client.request(
+                    "DELETE",
+                    f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts/{sid}",
+                    headers=headers,
+                )
+                if resp.status_code >= 400:
+                    errors.append({"id": sid, "status": resp.status_code, "body": resp.text[:300]})
+                    continue
+                deleted.extend(resp.json().get("data", {}).get("deletedShiftIds", [sid]))
+        return {"matched": len(matching_ids), "deleted_count": len(deleted), "errors": errors}
 
     return await asyncio.to_thread(_run)
 
