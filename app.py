@@ -806,13 +806,17 @@ async def debug_shift_custom_fields(token: str | None = None):
 
     def _run() -> dict[str, Any]:
         headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        attempts = [
+            f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/custom-fields/shifts",
+            f"{CONNECTEAM_BASE_URL}/scheduler/v1/custom-fields/shifts?schedulerId={CONNECTEAM_SCHEDULER_ID}",
+            f"{CONNECTEAM_BASE_URL}/scheduler/v1/custom-fields/shifts",
+        ]
+        results: dict[str, Any] = {}
         with httpx.Client(timeout=30) as client:
-            resp = client.get(
-                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/custom-fields/shifts",
-                headers=headers,
-            )
-            resp.raise_for_status()
-            return resp.json()
+            for url in attempts:
+                resp = client.get(url, headers=headers)
+                results[url] = {"status": resp.status_code, "body": resp.text[:1000]}
+        return results
 
     return await asyncio.to_thread(_run)
 
