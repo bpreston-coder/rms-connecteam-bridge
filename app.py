@@ -824,6 +824,54 @@ async def debug_shift_custom_fields(token: str | None = None):
     return await asyncio.to_thread(_run)
 
 
+@app.post("/debug/test-jobno-customfield")
+async def debug_test_jobno_customfield(token: str | None = None, value: str = "API-TEST-123"):
+    """One-off: create a draft shift via the PUBLIC Shifts API using
+    customFields: [{"id": 1317802, "value": ...}] -- field id 1317802 was
+    captured live from Connecteam's own web app request when saving the
+    "Job No." field on a shift in Elite Test Schedule. This checks whether
+    the same field id works through the public REST API (auth: X-API-KEY)
+    rather than the internal session-cookie-authenticated web app API."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
+        with httpx.Client(timeout=30) as client:
+            start = int(time.time()) + 3600
+            end = start + 3600
+            create_resp = client.post(
+                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+                headers=headers,
+                json=[{
+                    "title": "API JOBNO TEST - DELETE ME",
+                    "startTime": start,
+                    "endTime": end,
+                    "isPublished": False,
+                    "customFields": [{"id": 1317802, "value": value}],
+                }],
+            )
+            result: dict[str, Any] = {
+                "create_status": create_resp.status_code,
+                "create_body": create_resp.text[:2000],
+            }
+            if create_resp.status_code < 300:
+                try:
+                    shift_id = create_resp.json()["data"]["shifts"][0]["id"]
+                    result["shift_id"] = shift_id
+                    get_resp = client.get(
+                        f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts/{shift_id}",
+                        headers=headers,
+                    )
+                    result["get_status"] = get_resp.status_code
+                    result["get_body"] = get_resp.text[:2000]
+                except Exception as e:
+                    result["parse_error"] = str(e)
+            return result
+
+    return await asyncio.to_thread(_run)
+
+
 @app.post("/debug/create-test-jobs")
 async def debug_create_test_jobs(token: str | None = None, prefix: str = "TEST "):
     """One-off: create a Connecteam Job (category) for each distinct Current
