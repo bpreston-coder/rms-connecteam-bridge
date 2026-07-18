@@ -274,7 +274,13 @@ def find_job_by_service_name(
     exists; it does NOT create one. jobs_state is a title->jobId cache
     persisted in the state file so repeated syncs don't refetch the whole
     Jobs list every time."""
-    title = f"{CONNECTEAM_JOB_PREFIX}{service_name}"
+    # Built with an explicit space rather than relying on a trailing space
+    # surviving inside CONNECTEAM_JOB_PREFIX itself — env var UIs (Render
+    # included) tend to silently trim trailing whitespace on save, which
+    # would otherwise turn "TEST Lighting technician" into
+    # "TESTLighting technician" and break every lookup.
+    prefix = CONNECTEAM_JOB_PREFIX.strip()
+    title = f"{prefix} {service_name}" if prefix else service_name
 
     cache: dict[str, str] = jobs_state.setdefault("by_title", {})
     if title in cache:
@@ -866,6 +872,46 @@ async def debug_shift_custom_fields(token: str | None = None):
                 resp = client.get(url, headers=headers)
                 results[url] = {"status": resp.status_code, "body": resp.text[:1000]}
         return results
+
+    return await asyncio.to_thread(_run)
+
+
+@app.post("/debug/test-open-shift")
+async def debug_test_open_shift(token: str | None = None, max_slots: int = 4):
+    """One-off: create a draft shift via the public API with isOpenShift +
+    maxSlots to discover the real field names/behavior for multi-slot open
+    shifts (so N x quantity becomes 1 shift with N slots instead of N
+    separate shifts)."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
+        with httpx.Client(timeout=30) as client:
+            start = int(time.time()) + 3600
+            end = start + 3600
+            attempts = [
+                {"isOpenShift": True, "maxSlots": max_slots},
+                {"isOpenShift": True, "numOfUsers": max_slots},
+                {"isOpenShift": True, "openShiftUnlimitedSlots": False, "maxSlots": max_slots},
+            ]
+            results = []
+            for i, extra in enumerate(attempts):
+                payload = {
+                    "title": f"OPEN SHIFT TEST {i} - DELETE ME",
+                    "startTime": start + i * 7200,
+                    "endTime": end + i * 7200,
+                    "isPublished": False,
+                    **extra,
+                }
+                resp = client.post(
+                    f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+                    headers=headers,
+                    json=[payload],
+                )
+                entry: dict[str, Any] = {"sent": extra, "status": resp.status_code, "body": resp.text[:1500]}
+                results.append(entry)
+        return {"results": results}
 
     return await asyncio.to_thread(_run)
 
