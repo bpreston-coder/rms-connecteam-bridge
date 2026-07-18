@@ -931,14 +931,7 @@ async def debug_test_open_shift(token: str | None = None, max_slots: int = 4):
             start = int(time.time()) + 3600
             end = start + 3600
             attempts = [
-                {"isOpenShift": True, "openSpots": max_slots},
-                {"isOpenShift": True, "spots": max_slots},
-                {"isOpenShift": True, "slots": max_slots},
-                {"isOpenShift": True, "openShiftSpots": max_slots},
-                {"isOpenShift": True, "requiredUsers": max_slots},
-                {"isOpenShift": True, "positions": max_slots},
-                {"isOpenShift": True, "quantity": max_slots},
-                {"isOpenShift": True, "assignedUserIds": [], "openSpots": max_slots, "maxUsers": max_slots},
+                {"isOpenShift": True, "numOfUsers": max_slots},
             ]
             results = []
             for i, extra in enumerate(attempts):
