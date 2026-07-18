@@ -954,6 +954,38 @@ async def debug_test_open_shift(token: str | None = None, max_slots: int = 4):
     return await asyncio.to_thread(_run)
 
 
+@app.post("/debug/test-open-shift-update")
+async def debug_test_open_shift_update(shift_id: str, token: str | None = None, max_slots: int = 4):
+    """One-off: PUT (update, not create) isOpenShift+numOfUsers onto an
+    existing shift via the public API, then read it back, to check whether
+    the update path behaves differently from create for multi-slot open
+    shifts (the internal web-app request we captured was itself a PUT)."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
+        with httpx.Client(timeout=30) as client:
+            put_resp = client.put(
+                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+                headers=headers,
+                json=[{"shiftId": shift_id, "isOpenShift": True, "numOfUsers": max_slots}],
+            )
+            result: dict[str, Any] = {
+                "put_status": put_resp.status_code,
+                "put_body": put_resp.text[:2000],
+            }
+            get_resp = client.get(
+                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts/{shift_id}",
+                headers=headers,
+            )
+            result["get_status"] = get_resp.status_code
+            result["get_body"] = get_resp.text[:2000]
+            return result
+
+    return await asyncio.to_thread(_run)
+
+
 @app.get("/debug/test-job-lookup")
 async def debug_test_job_lookup(token: str | None = None, service_name: str = "Lighting technician"):
     """One-off: call find_job_by_service_name directly against a scratch
