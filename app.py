@@ -74,6 +74,17 @@ CONNECTEAM_JOB_PREFIX = os.environ.get("CONNECTEAM_JOB_PREFIX", "")
 # customFields: [{"customFieldId": ..., "value": ...}].
 CONNECTEAM_JOBNO_CUSTOM_FIELD_ID = int(os.environ.get("CONNECTEAM_JOBNO_CUSTOM_FIELD_ID", "1317802"))
 
+# Shift custom field id for "Quantity Required" — created specifically so
+# quantity > 1 line items (e.g. "4 x Lighting Technician") become ONE draft
+# shift with this field holding the number needed, instead of N separate
+# shifts. Connecteam's public API has no working multi-slot/open-shift
+# field (confirmed by direct testing: isOpenShift+numOfUsers is accepted
+# with HTTP 200 but never actually changes the stored openSpots when
+# created or updated through the public API — only the internal,
+# session-authenticated web app can do that). So admins read this field and
+# manually assign that many people to the single shift.
+CONNECTEAM_QTY_CUSTOM_FIELD_ID = int(os.environ.get("CONNECTEAM_QTY_CUSTOM_FIELD_ID", "1319220"))
+
 # Shared secret appended to protected URLs as ?token=... . Current RMS
 # webhooks aren't signed, so this query-string token is the gate for the
 # webhook endpoint — it's also required for /sync so randoms can't trigger
@@ -385,85 +396,87 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         # repeated in the title text.
         title = subject
 
-        # Current RMS line items with quantity > 1 become that many
-        # separate draft shifts (e.g. "4 x Lighting Technician" -> 4
-        # shifts), each individually assignable to a different crew member.
-        # Current RMS returns quantity as a decimal string (e.g. "4.0"),
-        # so int() directly would raise — go through float() first.
+        # Current RMS line items with quantity > 1 (e.g. "4 x Lighting
+        # Technician") become ONE draft shift, with that number written into
+        # the "Quantity Required" shift custom field — Connecteam's public
+        # API has no working way to make a single shift claimable by
+        # multiple people (see CONNECTEAM_QTY_CUSTOM_FIELD_ID comment
+        # above), so admins read this field and manually assign that many
+        # people to the shift. Current RMS returns quantity as a decimal
+        # string (e.g. "4.0"), so int() directly would raise — go through
+        # float() first.
         quantity = service.get("quantity") or 1
         try:
             quantity = max(1, int(float(quantity)))
         except (TypeError, ValueError):
             quantity = 1
 
-        for slot in range(quantity):
-            # Stable per-slot key so re-syncing with the same quantity
-            # updates the same shifts instead of duplicating; if quantity
-            # drops, the now-unmatched slot keys are simply left alone
-            # (deletion isn't attempted automatically here).
-            key = str(service["id"]) if quantity == 1 else f"{service['id']}:{slot}"
-            desired = {
+        key = str(service["id"])
+        desired = {
+            "startTime": start,
+            "endTime": end,
+            "title": title,
+            "jobId": job_id,
+            "orderNumber": order_number,
+            "address": address,
+            "quantity": quantity,
+        }
+
+        custom_fields = []
+        if order_number:
+            custom_fields.append(
+                {"customFieldId": CONNECTEAM_JOBNO_CUSTOM_FIELD_ID, "value": str(order_number)}
+            )
+        custom_fields.append(
+            {"customFieldId": CONNECTEAM_QTY_CUSTOM_FIELD_ID, "value": str(quantity)}
+        )
+
+        existing = shifts_state.get(key)
+        if existing is None:
+            payload: dict[str, Any] = {
                 "startTime": start,
                 "endTime": end,
                 "title": title,
-                "jobId": job_id,
-                "orderNumber": order_number,
-                "address": address,
+                "isPublished": False,
+                "notes": [
+                    {
+                        "html": (
+                            f"<p>Auto-created from Current RMS order "
+                            f"{opportunity.get('number', opportunity['id'])} "
+                            f"(opportunity item #{service['id']}).</p>"
+                        )
+                    }
+                ],
+                "customFields": custom_fields,
             }
-
-            existing = shifts_state.get(key)
-            if existing is None:
-                payload: dict[str, Any] = {
-                    "startTime": start,
-                    "endTime": end,
-                    "title": title,
-                    "isPublished": False,
-                    "notes": [
-                        {
-                            "html": (
-                                f"<p>Auto-created from Current RMS order "
-                                f"{opportunity.get('number', opportunity['id'])} "
-                                f"(opportunity item #{service['id']}"
-                                + (f", slot {slot + 1}/{quantity}" if quantity > 1 else "")
-                                + ").</p>"
-                            )
-                        }
-                    ],
-                }
-                if job_id:
-                    payload["jobId"] = job_id
-                if order_number:
-                    payload["customFields"] = [
-                        {"customFieldId": CONNECTEAM_JOBNO_CUSTOM_FIELD_ID, "value": str(order_number)}
-                    ]
-                if address:
-                    payload["locationData"] = {"isReferencedToJob": False, "gps": {"address": address}}
-                to_create.append((key, payload, desired))
-            elif (
-                existing.get("startTime") != start
-                or existing.get("endTime") != end
-                or existing.get("title") != title
-                or existing.get("jobId") != job_id
-                or existing.get("orderNumber") != order_number
-                or existing.get("address") != address
-            ):
-                update_payload: dict[str, Any] = {
-                    "shiftId": existing["shiftId"],
-                    "startTime": start,
-                    "endTime": end,
-                    "title": title,
-                }
-                if job_id:
-                    update_payload["jobId"] = job_id
-                if order_number:
-                    update_payload["customFields"] = [
-                        {"customFieldId": CONNECTEAM_JOBNO_CUSTOM_FIELD_ID, "value": str(order_number)}
-                    ]
-                if address:
-                    update_payload["locationData"] = {"isReferencedToJob": False, "gps": {"address": address}}
-                to_update.append((key, update_payload, desired))
-            else:
-                unchanged += 1
+            if job_id:
+                payload["jobId"] = job_id
+            if address:
+                payload["locationData"] = {"isReferencedToJob": False, "gps": {"address": address}}
+            to_create.append((key, payload, desired))
+        elif (
+            existing.get("startTime") != start
+            or existing.get("endTime") != end
+            or existing.get("title") != title
+            or existing.get("jobId") != job_id
+            or existing.get("orderNumber") != order_number
+            or existing.get("address") != address
+            or existing.get("quantity") != quantity
+        ):
+            update_payload: dict[str, Any] = {
+                "shiftId": existing["shiftId"],
+                "startTime": start,
+                "endTime": end,
+                "title": title,
+                "customFields": custom_fields,
+            }
+            if job_id:
+                update_payload["jobId"] = job_id
+            if address:
+                update_payload["locationData"] = {"isReferencedToJob": False, "gps": {"address": address}}
+            to_update.append((key, update_payload, desired))
+        else:
+            unchanged += 1
 
     if skipped:
         for name, reason in skipped:
@@ -912,76 +925,6 @@ async def debug_shifts_raw_by_title_prefix(prefix: str, token: str | None = None
                 offset = body.get("paging", {}).get("offset", offset + 500)
         matching = [s for s in shifts if (s.get("title") or "").startswith(prefix)]
         return {"matched": len(matching), "shifts": matching}
-
-    return await asyncio.to_thread(_run)
-
-
-@app.post("/debug/test-open-shift")
-async def debug_test_open_shift(token: str | None = None, max_slots: int = 4):
-    """One-off: create a draft shift via the public API with isOpenShift +
-    maxSlots to discover the real field names/behavior for multi-slot open
-    shifts (so N x quantity becomes 1 shift with N slots instead of N
-    separate shifts)."""
-    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
-        raise HTTPException(status_code=403, detail="invalid or missing token")
-
-    def _run() -> dict[str, Any]:
-        headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
-        with httpx.Client(timeout=30) as client:
-            start = int(time.time()) + 3600
-            end = start + 3600
-            attempts = [
-                {"isOpenShift": True, "numOfUsers": max_slots},
-            ]
-            results = []
-            for i, extra in enumerate(attempts):
-                payload = {
-                    "title": f"OPEN SHIFT TEST {i} - DELETE ME",
-                    "startTime": start + i * 7200,
-                    "endTime": end + i * 7200,
-                    "isPublished": False,
-                    **extra,
-                }
-                resp = client.post(
-                    f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
-                    headers=headers,
-                    json=[payload],
-                )
-                entry: dict[str, Any] = {"sent": extra, "status": resp.status_code, "body": resp.text[:1500]}
-                results.append(entry)
-        return {"results": results}
-
-    return await asyncio.to_thread(_run)
-
-
-@app.post("/debug/test-open-shift-update")
-async def debug_test_open_shift_update(shift_id: str, token: str | None = None, max_slots: int = 4):
-    """One-off: PUT (update, not create) isOpenShift+numOfUsers onto an
-    existing shift via the public API, then read it back, to check whether
-    the update path behaves differently from create for multi-slot open
-    shifts (the internal web-app request we captured was itself a PUT)."""
-    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
-        raise HTTPException(status_code=403, detail="invalid or missing token")
-
-    def _run() -> dict[str, Any]:
-        headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
-        with httpx.Client(timeout=30) as client:
-            put_resp = client.put(
-                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
-                headers=headers,
-                json=[{"shiftId": shift_id, "isOpenShift": True, "numOfUsers": max_slots}],
-            )
-            result: dict[str, Any] = {
-                "put_status": put_resp.status_code,
-                "put_body": put_resp.text[:2000],
-            }
-            get_resp = client.get(
-                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts/{shift_id}",
-                headers=headers,
-            )
-            result["get_status"] = get_resp.status_code
-            result["get_body"] = get_resp.text[:2000]
-            return result
 
     return await asyncio.to_thread(_run)
 
