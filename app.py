@@ -811,32 +811,22 @@ async def debug_create_test_jobs(token: str | None = None, prefix: str = "TEST "
     def _run() -> dict[str, Any]:
         headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
         with httpx.Client(timeout=30) as client:
-            # 1. Collect distinct service names (same scan as /debug/service-types).
+            # 1. Pull the authoritative Service catalog from Current RMS
+            # (System Setup > Services), not just names seen on recent orders.
             names: set[str] = set()
             page = 1
-            orders_scanned = 0
-            while orders_scanned < 80:
+            while True:
                 resp = client.get(
-                    f"{CURRENT_RMS_BASE_URL}/api/v1/opportunities",
+                    f"{CURRENT_RMS_BASE_URL}/api/v1/services",
                     headers=rms_headers(),
-                    params={"q[state_eq]": 3, "per_page": 25, "page": page, "sort": "-updated_at"},
+                    params={"per_page": 100, "page": page, "q[active_eq]": "true"},
                 )
                 resp.raise_for_status()
                 body = resp.json()
-                opps = body["opportunities"]
-                if not opps:
-                    break
-                for o in opps:
-                    if orders_scanned >= 80:
-                        break
-                    orders_scanned += 1
-                    try:
-                        for s in fetch_service_items(client, o["id"]):
-                            names.add(s["name"])
-                    except httpx.HTTPStatusError:
-                        continue
+                for s in body["services"]:
+                    names.add(s["name"])
                 meta = body.get("meta", {})
-                if page * meta.get("per_page", 25) >= meta.get("total_row_count", 0):
+                if page * meta.get("per_page", 100) >= meta.get("total_row_count", 0):
                     break
                 page += 1
 
