@@ -57,6 +57,23 @@ CONNECTEAM_API_KEY = os.environ["CONNECTEAM_API_KEY"]
 CONNECTEAM_SCHEDULER_ID = os.environ["CONNECTEAM_SCHEDULER_ID"]
 CONNECTEAM_BASE_URL = os.environ.get("CONNECTEAM_BASE_URL", "https://api.connecteam.com")
 
+# Jobs in Connecteam represent TASK TYPES (e.g. "Lighting Technician"), one
+# per Current RMS Service — never one per order. This service only ever
+# *looks up* an existing Job by title (prefix + service name); it never
+# creates Jobs. While testing in "Elite Test Schedule" the Jobs are all
+# prefixed "TEST " (see /debug/create-test-jobs) so they're easy to tell
+# apart from anything real. Clear this env var when pointed at production.
+CONNECTEAM_JOB_PREFIX = os.environ.get("CONNECTEAM_JOB_PREFIX", "")
+
+# Shift custom field id for the "Job No." box in the shift editor (renamed
+# to "Opportunity No." by the user in the test schedule's UI). Captured live
+# from Connecteam's own web app request when saving that field on a shift —
+# it's genuinely per-shift and independent of whichever Job is selected, so
+# it's safe to hold the Current RMS order number even though many shifts
+# will share the same task-type Job. The public Shifts API takes this as
+# customFields: [{"customFieldId": ..., "value": ...}].
+CONNECTEAM_JOBNO_CUSTOM_FIELD_ID = int(os.environ.get("CONNECTEAM_JOBNO_CUSTOM_FIELD_ID", "1317802"))
+
 # Shared secret appended to protected URLs as ?token=... . Current RMS
 # webhooks aren't signed, so this query-string token is the gate for the
 # webhook endpoint — it's also required for /sync so randoms can't trigger
@@ -97,12 +114,13 @@ def _load_state() -> dict[str, Any]:
         try:
             data = json.loads(STATE_FILE.read_text())
             data.setdefault("shifts", {})
-            data.setdefault("jobs", {})
+            data.setdefault("jobs", {})  # legacy per-order job cache, unused by current code
+            data.setdefault("job_title_cache", {})
             data.setdefault("poll_cursor", None)
             return data
         except (json.JSONDecodeError, OSError):
             log.warning("Could not read state file %s, starting fresh", STATE_FILE)
-    return {"shifts": {}, "jobs": {}, "poll_cursor": None}
+    return {"shifts": {}, "jobs": {}, "job_title_cache": {}, "poll_cursor": None}
 
 
 def _save_state(state: dict[str, Any]) -> None:
@@ -221,75 +239,59 @@ def _to_epoch_seconds(iso_ts: str) -> int:
     return int(dt.astimezone(timezone.utc).timestamp())
 
 
-def find_or_create_job(
-    client: httpx.Client, opportunity: dict[str, Any], address: str | None, jobs_state: dict[str, Any]
-) -> str | None:
-    """Find (by Job No. / code) or create the Connecteam Job for this order,
-    so its "Job No." box holds the Current RMS order number and its address
-    field holds the venue address. Keeps the address in sync on later calls.
-    Returns the Connecteam jobId, or None if the order has no number to key
-    off of."""
-    number = opportunity.get("number")
-    if not number:
-        return None
-
-    headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
-    subject = opportunity.get("subject") or f"Order {number}"
-    title = f"{subject} ({number})"
-
-    cached = jobs_state.get(number)
-    if cached:
-        job_id = cached["jobId"]
-        if cached.get("address") != address:
-            resp = client.put(
-                f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs/{job_id}",
-                headers=headers,
-                json={
-                    "title": cached.get("title", title),
-                    "code": number,
-                    "assign": {"type": "both", "userIds": [], "groupIds": []},
-                    "gps": {"address": address} if address else None,
-                },
-            )
-            if resp.status_code >= 400:
-                log.error("Connecteam rejected job address update: %s %s", resp.status_code, resp.text)
-                resp.raise_for_status()
-            cached["address"] = address
-        return job_id
-
-    # Not cached locally — look for an existing job with this Job No. before
-    # creating, so a state-file reset doesn't produce duplicate jobs.
-    resp = client.get(
-        f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
-        headers=headers,
-        params={"jobCodes": number, "instanceIds": CONNECTEAM_SCHEDULER_ID},
-    )
-    resp.raise_for_status()
-    existing = resp.json().get("data", {}).get("jobs", [])
-    if existing:
-        job = existing[0]
-        jobs_state[number] = {"jobId": job["jobId"], "title": job.get("title", title), "address": address}
-        return job["jobId"]
-
-    job_payload: dict[str, Any] = {
-        "instanceIds": [int(CONNECTEAM_SCHEDULER_ID)],
-        "title": title,
-        "code": number,
-        "assign": {"type": "both", "userIds": [], "groupIds": []},
-    }
-    if address:
-        job_payload["gps"] = {"address": address}
-
-    resp = client.post(
-        f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
-        headers=headers,
-        json=[job_payload],
-    )
-    if resp.status_code >= 400:
-        log.error("Connecteam rejected job creation: %s %s", resp.status_code, resp.text)
+def _load_job_title_cache(client: httpx.Client) -> dict[str, str]:
+    """Fetch every Job in this scheduler and index by exact title. Jobs are
+    curated task types (see /debug/create-test-jobs) — this never creates
+    one, only looks them up."""
+    headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+    by_title: dict[str, str] = {}
+    offset = 0
+    while True:
+        resp = client.get(
+            f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+            headers=headers,
+            params={"instanceIds": CONNECTEAM_SCHEDULER_ID, "limit": 500, "offset": offset},
+        )
         resp.raise_for_status()
-    job_id = resp.json()["data"]["jobs"][0]["jobId"]
-    jobs_state[number] = {"jobId": job_id, "title": title, "address": address}
+        body = resp.json()
+        jobs = body.get("data", {}).get("jobs", [])
+        for j in jobs:
+            if j.get("title"):
+                by_title[j["title"]] = j["jobId"]
+        if len(jobs) < 500:
+            break
+        offset = body.get("paging", {}).get("offset", offset + 500)
+    return by_title
+
+
+def find_job_by_service_name(
+    client: httpx.Client, service_name: str, jobs_state: dict[str, Any]
+) -> str | None:
+    """Look up the task-type Job whose title is
+    f"{CONNECTEAM_JOB_PREFIX}{service_name}" (e.g. "TEST Lighting
+    Technician" while testing, or just "Lighting Technician" in
+    production). Returns None — and logs a warning — if no matching Job
+    exists; it does NOT create one. jobs_state is a title->jobId cache
+    persisted in the state file so repeated syncs don't refetch the whole
+    Jobs list every time."""
+    title = f"{CONNECTEAM_JOB_PREFIX}{service_name}"
+
+    cache: dict[str, str] = jobs_state.setdefault("by_title", {})
+    if title in cache:
+        return cache[title]
+
+    # Cache miss: refresh the whole title->jobId map once (cheap — Jobs
+    # lists are small) and look again, in case a Job was added since the
+    # cache was last built.
+    cache.clear()
+    cache.update(_load_job_title_cache(client))
+
+    job_id = cache.get(title)
+    if job_id is None:
+        log.warning(
+            "No Connecteam Job titled '%s' found for scheduler %s — shift will be created without a Job",
+            title, CONNECTEAM_SCHEDULER_ID,
+        )
     return job_id
 
 
@@ -345,7 +347,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         return {"status": "skipped", "reason": "no dated Service line items found"}
 
     address = fetch_venue_address(client, opportunity)
-    job_id = find_or_create_job(client, opportunity, address, state["jobs"])
+    order_number = opportunity.get("number")
+    job_title_cache: dict[str, Any] = state["job_title_cache"]
 
     subject = opportunity.get("subject") or f"Order {opportunity.get('number', opportunity['id'])}"
     shifts_state: dict[str, Any] = state["shifts"]
@@ -366,49 +369,92 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             skipped.append((service["name"], "duration exceeds Connecteam's 24h shift limit"))
             continue
 
-        title = f"{subject} — {service['name']}"
-        key = str(service["id"])
-        desired = {"startTime": start, "endTime": end, "title": title, "jobId": job_id}
+        # Job = task type, matched by Service name (e.g. "Lighting
+        # Technician") — never created per-order. The opportunity name only
+        # ever goes into the shift title text, per the corrected design.
+        job_id = find_job_by_service_name(client, service["name"], job_title_cache)
 
-        existing = shifts_state.get(key)
-        if existing is None:
-            payload: dict[str, Any] = {
+        title = f"{subject} — {service['name']}"
+
+        # Current RMS line items with quantity > 1 become that many
+        # separate draft shifts (e.g. "4 x Lighting Technician" -> 4
+        # shifts), each individually assignable to a different crew member.
+        # Current RMS returns quantity as a decimal string (e.g. "4.0"),
+        # so int() directly would raise — go through float() first.
+        quantity = service.get("quantity") or 1
+        try:
+            quantity = max(1, int(float(quantity)))
+        except (TypeError, ValueError):
+            quantity = 1
+
+        for slot in range(quantity):
+            # Stable per-slot key so re-syncing with the same quantity
+            # updates the same shifts instead of duplicating; if quantity
+            # drops, the now-unmatched slot keys are simply left alone
+            # (deletion isn't attempted automatically here).
+            key = str(service["id"]) if quantity == 1 else f"{service['id']}:{slot}"
+            desired = {
                 "startTime": start,
                 "endTime": end,
                 "title": title,
-                "isPublished": False,
-                "notes": [
-                    {
-                        "html": (
-                            f"<p>Auto-created from Current RMS order "
-                            f"{opportunity.get('number', opportunity['id'])} "
-                            f"(opportunity item #{service['id']}).</p>"
-                        )
-                    }
-                ],
+                "jobId": job_id,
+                "orderNumber": order_number,
+                "address": address,
             }
-            if job_id:
-                payload["jobId"] = job_id
-                payload["locationData"] = {"isReferencedToJob": True}
-            to_create.append((key, payload, desired))
-        elif (
-            existing.get("startTime") != start
-            or existing.get("endTime") != end
-            or existing.get("title") != title
-            or existing.get("jobId") != job_id
-        ):
-            update_payload: dict[str, Any] = {
-                "shiftId": existing["shiftId"],
-                "startTime": start,
-                "endTime": end,
-                "title": title,
-            }
-            if job_id and existing.get("jobId") != job_id:
-                update_payload["jobId"] = job_id
-                update_payload["locationData"] = {"isReferencedToJob": True}
-            to_update.append((key, update_payload, desired))
-        else:
-            unchanged += 1
+
+            existing = shifts_state.get(key)
+            if existing is None:
+                payload: dict[str, Any] = {
+                    "startTime": start,
+                    "endTime": end,
+                    "title": title,
+                    "isPublished": False,
+                    "notes": [
+                        {
+                            "html": (
+                                f"<p>Auto-created from Current RMS order "
+                                f"{opportunity.get('number', opportunity['id'])} "
+                                f"(opportunity item #{service['id']}"
+                                + (f", slot {slot + 1}/{quantity}" if quantity > 1 else "")
+                                + ").</p>"
+                            )
+                        }
+                    ],
+                }
+                if job_id:
+                    payload["jobId"] = job_id
+                if order_number:
+                    payload["customFields"] = [
+                        {"customFieldId": CONNECTEAM_JOBNO_CUSTOM_FIELD_ID, "value": str(order_number)}
+                    ]
+                if address:
+                    payload["locationData"] = {"isReferencedToJob": False, "gps": {"address": address}}
+                to_create.append((key, payload, desired))
+            elif (
+                existing.get("startTime") != start
+                or existing.get("endTime") != end
+                or existing.get("title") != title
+                or existing.get("jobId") != job_id
+                or existing.get("orderNumber") != order_number
+                or existing.get("address") != address
+            ):
+                update_payload: dict[str, Any] = {
+                    "shiftId": existing["shiftId"],
+                    "startTime": start,
+                    "endTime": end,
+                    "title": title,
+                }
+                if job_id:
+                    update_payload["jobId"] = job_id
+                if order_number:
+                    update_payload["customFields"] = [
+                        {"customFieldId": CONNECTEAM_JOBNO_CUSTOM_FIELD_ID, "value": str(order_number)}
+                    ]
+                if address:
+                    update_payload["locationData"] = {"isReferencedToJob": False, "gps": {"address": address}}
+                to_update.append((key, update_payload, desired))
+            else:
+                unchanged += 1
 
     if skipped:
         for name, reason in skipped:
