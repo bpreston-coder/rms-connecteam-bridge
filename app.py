@@ -870,6 +870,35 @@ async def debug_shift_custom_fields(token: str | None = None):
     return await asyncio.to_thread(_run)
 
 
+@app.get("/debug/test-job-lookup")
+async def debug_test_job_lookup(token: str | None = None, service_name: str = "Lighting technician"):
+    """One-off: call find_job_by_service_name directly against a scratch
+    cache dict (not the real state file) to see what it resolves to and
+    surface any exception, since a real sync run silently returns None on
+    no-match instead of raising."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        scratch: dict[str, Any] = {}
+        with httpx.Client(timeout=30) as client:
+            try:
+                job_id = find_job_by_service_name(client, service_name, scratch)
+            except Exception as e:
+                return {"error": f"{type(e).__name__}: {e}"}
+        title = f"{CONNECTEAM_JOB_PREFIX}{service_name}"
+        return {
+            "connecteam_job_prefix": repr(CONNECTEAM_JOB_PREFIX),
+            "looked_up_title": title,
+            "resolved_job_id": job_id,
+            "cache_keys_sample": list(scratch.get("by_title", {}).keys())[:10],
+            "cache_size": len(scratch.get("by_title", {})),
+            "exact_title_in_cache": title in scratch.get("by_title", {}),
+        }
+
+    return await asyncio.to_thread(_run)
+
+
 @app.post("/debug/test-jobno-customfield")
 async def debug_test_jobno_customfield(token: str | None = None, value: str = "API-TEST-123"):
     """One-off: create a draft shift via the PUBLIC Shifts API using
