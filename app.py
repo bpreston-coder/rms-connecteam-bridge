@@ -848,7 +848,7 @@ async def debug_test_jobno_customfield(token: str | None = None, value: str = "A
                     "startTime": start,
                     "endTime": end,
                     "isPublished": False,
-                    "customFields": [{"id": 1317802, "value": value}],
+                    "customFields": [{"customFieldId": 1317802, "value": value}],
                 }],
             )
             result: dict[str, Any] = {
