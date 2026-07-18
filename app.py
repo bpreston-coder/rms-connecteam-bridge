@@ -765,6 +765,100 @@ async def debug_service_types(token: str | None = None, max_orders: int = 60):
     return await asyncio.to_thread(_run)
 
 
+@app.post("/debug/create-test-jobs")
+async def debug_create_test_jobs(token: str | None = None, prefix: str = "TEST "):
+    """One-off: create a Connecteam Job (category) for each distinct Current
+    RMS Service line-item name, named "<prefix><service name>", in whichever
+    scheduler CONNECTEAM_SCHEDULER_ID currently points at. Skips names that
+    already have a matching-titled Job (idempotent-ish safety net)."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
+        with httpx.Client(timeout=30) as client:
+            # 1. Collect distinct service names (same scan as /debug/service-types).
+            names: set[str] = set()
+            page = 1
+            orders_scanned = 0
+            while orders_scanned < 80:
+                resp = client.get(
+                    f"{CURRENT_RMS_BASE_URL}/api/v1/opportunities",
+                    headers=rms_headers(),
+                    params={"q[state_eq]": 3, "per_page": 25, "page": page, "sort": "-updated_at"},
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                opps = body["opportunities"]
+                if not opps:
+                    break
+                for o in opps:
+                    if orders_scanned >= 80:
+                        break
+                    orders_scanned += 1
+                    try:
+                        for s in fetch_service_items(client, o["id"]):
+                            names.add(s["name"])
+                    except httpx.HTTPStatusError:
+                        continue
+                meta = body.get("meta", {})
+                if page * meta.get("per_page", 25) >= meta.get("total_row_count", 0):
+                    break
+                page += 1
+
+            # 2. Existing job titles in this scheduler, to skip duplicates.
+            existing_titles: set[str] = set()
+            offset = 0
+            while True:
+                resp = client.get(
+                    f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+                    headers=headers,
+                    params={"instanceIds": CONNECTEAM_SCHEDULER_ID, "limit": 500, "offset": offset},
+                )
+                resp.raise_for_status()
+                jb = resp.json()
+                jobs = jb.get("data", {}).get("jobs", [])
+                for j in jobs:
+                    if j.get("title"):
+                        existing_titles.add(j["title"])
+                if len(jobs) < 500:
+                    break
+                offset = jb.get("paging", {}).get("offset", offset + 500)
+
+            # 3. Create one Job per new service name.
+            created: list[str] = []
+            skipped: list[str] = []
+            errors: list[dict[str, Any]] = []
+            for name in sorted(names):
+                title = f"{prefix}{name}"
+                if title in existing_titles:
+                    skipped.append(title)
+                    continue
+                resp = client.post(
+                    f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+                    headers=headers,
+                    json=[{
+                        "instanceIds": [int(CONNECTEAM_SCHEDULER_ID)],
+                        "title": title,
+                        "assign": {"type": "both", "userIds": [], "groupIds": []},
+                    }],
+                )
+                if resp.status_code >= 400:
+                    errors.append({"title": title, "status": resp.status_code, "body": resp.text[:300]})
+                    continue
+                created.append(title)
+
+        return {
+            "scheduler_id": CONNECTEAM_SCHEDULER_ID,
+            "distinct_service_names_found": len(names),
+            "created": created,
+            "skipped_already_existed": skipped,
+            "errors": errors,
+        }
+
+    return await asyncio.to_thread(_run)
+
+
 @app.delete("/debug/shifts")
 async def debug_delete_shifts(ids: str, token: str | None = None):
     """ids = comma-separated Connecteam shift IDs to permanently delete."""
