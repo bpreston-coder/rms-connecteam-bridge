@@ -780,6 +780,25 @@ async def debug_schedulers(token: str | None = None):
     return await asyncio.to_thread(_run)
 
 
+@app.get("/debug/jobs-list")
+async def debug_jobs_list(token: str | None = None):
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        with httpx.Client(timeout=30) as client:
+            resp = client.get(
+                f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+                headers=headers,
+                params={"instanceIds": CONNECTEAM_SCHEDULER_ID, "limit": 500, "offset": 0},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    return await asyncio.to_thread(_run)
+
+
 @app.post("/debug/create-test-jobs")
 async def debug_create_test_jobs(token: str | None = None, prefix: str = "TEST "):
     """One-off: create a Connecteam Job (category) for each distinct Current
