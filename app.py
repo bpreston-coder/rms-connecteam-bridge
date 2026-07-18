@@ -708,6 +708,63 @@ async def debug_shift_lookup(ids: str, token: str | None = None):
     return await asyncio.to_thread(_run)
 
 
+@app.get("/debug/service-types")
+async def debug_service_types(token: str | None = None, max_orders: int = 60):
+    """Scan the most-recently-updated Order-state opportunities and return
+    every distinct Service line-item name seen, with an example order and a
+    count. Read-only; touches Current RMS only."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        names: dict[str, dict[str, Any]] = {}
+        orders_scanned = 0
+        with httpx.Client(timeout=30) as client:
+            page = 1
+            while orders_scanned < max_orders:
+                resp = client.get(
+                    f"{CURRENT_RMS_BASE_URL}/api/v1/opportunities",
+                    headers=rms_headers(),
+                    params={
+                        "q[state_eq]": 3,
+                        "per_page": 25,
+                        "page": page,
+                        "sort": "-updated_at",
+                    },
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                opps = body["opportunities"]
+                if not opps:
+                    break
+                for o in opps:
+                    if orders_scanned >= max_orders:
+                        break
+                    orders_scanned += 1
+                    try:
+                        services = fetch_service_items(client, o["id"])
+                    except httpx.HTTPStatusError:
+                        continue
+                    for s in services:
+                        entry = names.setdefault(
+                            s["name"],
+                            {"count": 0, "example_order": o.get("number"), "example_subject": o.get("subject")},
+                        )
+                        entry["count"] += 1
+                meta = body.get("meta", {})
+                if page * meta.get("per_page", 25) >= meta.get("total_row_count", 0):
+                    break
+                page += 1
+
+        return {
+            "orders_scanned": orders_scanned,
+            "distinct_service_names": len(names),
+            "services": names,
+        }
+
+    return await asyncio.to_thread(_run)
+
+
 @app.delete("/debug/shifts")
 async def debug_delete_shifts(ids: str, token: str | None = None):
     """ids = comma-separated Connecteam shift IDs to permanently delete."""
