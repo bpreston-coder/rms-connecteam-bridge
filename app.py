@@ -478,6 +478,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     job_title_cache: dict[str, Any] = state["job_title_cache"]
 
     subject = opportunity.get("subject") or f"Order {opportunity.get('number', opportunity['id'])}"
+    if "#" in subject:
+        subject = subject.split("#", 1)[1].strip()
     shifts_state: dict[str, Any] = state["shifts"]
 
     to_create: list[tuple[str, dict[str, Any], dict[str, Any]]] = []  # (key, payload, desired)
