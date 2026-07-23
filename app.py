@@ -694,6 +694,10 @@ async def opportunity_converted(request: Request, token: str | None = None):
         with sync_lock:
             state = _load_state()
             with httpx.Client(timeout=30) as client:
+            if action.get("Action_type") == "destroy":                # Deleted opportunity: fetch_opportunity would 404, so clean up tracked shifts directly.
+                result = cleanup_ineligible_opportunity(client, opportunity_id, "deleted", state)
+                result = {"status": "skipped", "reason": "deleted", **result}
+            else:
                 result = sync_opportunity(client, opportunity_id, state)
             _save_state(state)
             return result
