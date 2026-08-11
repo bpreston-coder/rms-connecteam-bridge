@@ -285,12 +285,14 @@ def _to_epoch_seconds(iso_ts: str) -> int:
     return int(dt.astimezone(timezone.utc).timestamp())
 
 
-def _load_job_title_cache(client: httpx.Client) -> dict[str, str]:
-    """Fetch every Job in this scheduler and index by exact title. Jobs are
-    curated task types (see /debug/create-test-jobs) — this never creates
-    one, only looks them up."""
+def _load_job_title_cache(client: httpx.Client) -> tuple[dict[str, str], dict[str, str]]:
+    """Fetch every Job in this scheduler and index by exact title, and
+    separately by jobId -> color (so shift payloads can inherit the Job's
+    current color). Jobs are curated task types (see
+    /debug/create-test-jobs) — this never creates one, only looks them up."""
     headers = {"X-API-KEY": CONNECTEAM_API_KEY}
     by_title: dict[str, str] = {}
+    by_jobid_color: dict[str, str] = {}
     offset = 0
     while True:
         resp = client.get(
@@ -304,10 +306,12 @@ def _load_job_title_cache(client: httpx.Client) -> dict[str, str]:
         for j in jobs:
             if j.get("title"):
                 by_title[j["title"]] = j["jobId"]
+            if j.get("color"):
+                by_jobid_color[j["jobId"]] = j["color"]
         if len(jobs) < 500:
             break
         offset = body.get("paging", {}).get("offset", offset + 500)
-    return by_title
+    return by_title, by_jobid_color
 
 
 def find_job_by_service_name(
@@ -329,14 +333,30 @@ def find_job_by_service_name(
     title = f"{prefix} {service_name}" if prefix else service_name
 
     cache: dict[str, str] = jobs_state.setdefault("by_title", {})
-    if title in cache:
-        return cache[title]
+    color_cache: dict[str, str] = jobs_state.setdefault("by_jobid_color", {})
 
-    # Cache miss: refresh the whole title->jobId map once (cheap — Jobs
-    # lists are small) and look again, in case a Job was added since the
-    # cache was last built.
+    if title in cache:
+        job_id = cache[title]
+        if job_id not in color_cache:
+            # Color cache is missing/stale for this job (e.g. state file
+            # predates the color-cache feature, or the Job's color changed
+            # since the cache was built) — refresh once so callers get an
+            # up-to-date color without waiting for an unrelated title miss.
+            by_title, by_jobid_color = _load_job_title_cache(client)
+            cache.clear()
+            cache.update(by_title)
+            color_cache.clear()
+            color_cache.update(by_jobid_color)
+        return job_id
+
+    # Cache miss: refresh the whole title->jobId (and jobId->color) map once
+    # (cheap — Jobs lists are small) and look again, in case a Job was added
+    # since the cache was last built.
+    by_title, by_jobid_color = _load_job_title_cache(client)
     cache.clear()
-    cache.update(_load_job_title_cache(client))
+    cache.update(by_title)
+    color_cache.clear()
+    color_cache.update(by_jobid_color)
 
     job_id = cache.get(title)
     if job_id is None:
@@ -345,6 +365,16 @@ def find_job_by_service_name(
             title, CONNECTEAM_SCHEDULER_ID,
         )
     return job_id
+
+
+def get_job_color(job_id: str | None, jobs_state: dict[str, Any]) -> str | None:
+    """Look up the current color of a Job from the cache populated by
+    find_job_by_service_name. Returns None if unknown (job_id missing, or
+    the color cache hasn't been built yet) — callers should omit the
+    "color" key entirely in that case rather than send a bogus value."""
+    if not job_id:
+        return None
+    return jobs_state.get("by_jobid_color", {}).get(job_id)
 
 
 def create_shifts(client: httpx.Client, payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -502,6 +532,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         # Technician") — never created per-order. The opportunity name only
         # ever goes into the shift title text, per the corrected design.
         job_id = find_job_by_service_name(client, service["name"], job_title_cache)
+        job_color = get_job_color(job_id, job_title_cache)
 
         # Shift title is just the opportunity name — the service/task type
         # is already conveyed by the Job dropdown, so it doesn't need to be
@@ -530,6 +561,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             "endTime": end,
             "title": title,
             "jobId": job_id,
+            "color": job_color,
             "orderNumber": order_number,
             "address": address,
             "quantity": quantity,
@@ -564,6 +596,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             }
             if job_id:
                 payload["jobId"] = job_id
+            if job_color:
+                payload["color"] = job_color
             if address:
                 payload["locationData"] = {"isReferencedToJob": False, "gps": {"address": address}}
             to_create.append((key, payload, desired))
@@ -572,6 +606,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             or existing.get("endTime") != end
             or existing.get("title") != title
             or existing.get("jobId") != job_id
+            or existing.get("color") != job_color
             or existing.get("orderNumber") != order_number
             or existing.get("address") != address
             or existing.get("quantity") != quantity
@@ -585,6 +620,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             }
             if job_id:
                 update_payload["jobId"] = job_id
+            if job_color:
+                update_payload["color"] = job_color
             if address:
                 update_payload["locationData"] = {"isReferencedToJob": False, "gps": {"address": address}}
             to_update.append((key, update_payload, desired))
