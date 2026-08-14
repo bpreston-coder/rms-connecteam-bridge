@@ -774,7 +774,11 @@ async def manual_sync(token: str | None = None):
 
 @app.get("/debug/inspect-service-items")
 async def debug_inspect_service_items(
-    token: str | None = None, opportunity_id: int | None = None, lookback_days: int = 90
+    token: str | None = None,
+    opportunity_id: int | None = None,
+    lookback_days: int = 90,
+    require_description: bool = False,
+    max_matches: int = 5,
 ):
     """TEMPORARY, read-only. Dumps the raw Current RMS opportunity_item JSON
     for one or more Service line items so we can confirm the exact field
@@ -784,8 +788,12 @@ async def debug_inspect_service_items(
     and confirmed live.
 
     If opportunity_id is given, inspects that opportunity's Service items
-    directly. Otherwise scans Order/Quotation-state opportunities updated
-    in the last lookback_days for the first one with dated Service items."""
+    directly. Otherwise scans Order/Quotation-state opportunities updated in
+    the last lookback_days. With require_description=true, keeps scanning
+    (instead of stopping at the first opportunity with any Service items)
+    and collects up to max_matches items whose "description" field is
+    actually non-empty, so we can see real text like "Bump in" rather than
+    confirming the field exists but is blank."""
     if not DEBUG_TOKEN or not hmac.compare_digest(token or "", DEBUG_TOKEN):
         raise HTTPException(status_code=403, detail="invalid or missing token")
 
@@ -796,6 +804,30 @@ async def debug_inspect_service_items(
             else:
                 since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
                 candidate_ids = fetch_opportunities_updated_since(client, since)
+
+            if require_description:
+                matches: list[dict[str, Any]] = []
+                opportunities_checked = 0
+                for oid in candidate_ids:
+                    opportunities_checked += 1
+                    try:
+                        items = fetch_service_items(client, oid)
+                    except httpx.HTTPStatusError:
+                        continue
+                    for item in items:
+                        if (item.get("description") or "").strip():
+                            matches.append({"opportunity_id": oid, "item": item})
+                            if len(matches) >= max_matches:
+                                return {
+                                    "opportunities_checked": opportunities_checked,
+                                    "match_count": len(matches),
+                                    "matches": matches,
+                                }
+                return {
+                    "opportunities_checked": opportunities_checked,
+                    "match_count": len(matches),
+                    "matches": matches,
+                }
 
             for oid in candidate_ids:
                 try:
