@@ -864,6 +864,62 @@ async def manual_sync(token: str | None = None):
     return JSONResponse(result)
 
 
+@app.get("/debug/inspect-job-mapping")
+async def debug_inspect_job_mapping(opportunity_id: int, token: str | None = None):
+    """TEMPORARY, diagnostic only, no writes. Even after the stale-Job-ID
+    retry fix, opportunities 3108/3898/3908/3925/3926/3949 still fail with
+    the identical job_id d3b78021-... "does not exist" — meaning a fresh
+    Jobs list fetch is STILL resolving that title to that same (rejected)
+    id. Returns the Service item names for this opportunity plus every raw
+    Jobs entry (title/jobId/color/archived) whose title matches, so we can
+    see whether there are duplicate/conflicting Job entries for the same
+    title. Protected by BACKFILL_TOKEN (reused — diagnostic, not a write).
+    Remove this route once the mismatch is understood."""
+    if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        with httpx.Client(timeout=30) as client:
+            services = fetch_service_items(client, opportunity_id)
+            service_names = sorted({s["name"] for s in services})
+
+            headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+            all_jobs: list[dict[str, Any]] = []
+            offset = 0
+            while True:
+                resp = client.get(
+                    f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+                    headers=headers,
+                    params={"instanceIds": CONNECTEAM_SCHEDULER_ID, "limit": 500, "offset": offset},
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                jobs = body.get("data", {}).get("jobs", [])
+                all_jobs.extend(jobs)
+                if len(jobs) < 500:
+                    break
+                offset = body.get("paging", {}).get("offset", offset + 500)
+
+            prefix = CONNECTEAM_JOB_PREFIX.strip()
+            matches: dict[str, list[dict[str, Any]]] = {}
+            for name in service_names:
+                title = f"{prefix} {name}" if prefix else name
+                matches[title] = [
+                    {k: j.get(k) for k in ("jobId", "title", "color", "isArchived", "isDeleted")}
+                    for j in all_jobs
+                    if j.get("title") == title
+                ]
+            return {
+                "opportunity_id": opportunity_id,
+                "service_names": service_names,
+                "matches_by_title": matches,
+                "total_jobs_in_scheduler": len(all_jobs),
+            }
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
 @app.get("/backfill")
 async def backfill(token: str | None = None, ids: str | None = None):
     """TEMPORARY, one-off. Resyncs every current Order/Quotation-state
