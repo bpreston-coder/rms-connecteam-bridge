@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import html
 import json
 import logging
 import os
@@ -95,17 +94,20 @@ CONNECTEAM_JOBNO_CUSTOM_FIELD_ID = int(os.environ.get("CONNECTEAM_JOBNO_CUSTOM_F
 # manually assign that many people to the single shift.
 CONNECTEAM_QTY_CUSTOM_FIELD_ID = int(os.environ.get("CONNECTEAM_QTY_CUSTOM_FIELD_ID", "1319220"))
 
+# Shift custom field id for "Shift Type/Notes" — holds the Current RMS
+# Service line item's free-text description verbatim (e.g. "Bump in Day
+# 1"), confirmed live via GET /scheduler/v1/schedulers/{id}/custom-fields
+# against Elite Primary Schedule. Field id, not name, is what the Shifts
+# API takes.
+CONNECTEAM_SHIFT_TYPE_CUSTOM_FIELD_ID = int(
+    os.environ.get("CONNECTEAM_SHIFT_TYPE_CUSTOM_FIELD_ID", "1353115")
+)
+
 # Shared secret appended to protected URLs as ?token=... . Current RMS
 # webhooks aren't signed, so this query-string token is the gate for the
 # webhook endpoint — it's also required for /sync so randoms can't trigger
 # an unscheduled full sync. Keep the URL itself private too.
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
-
-# Separate shared secret for the temporary /debug/* endpoint below, kept
-# distinct from WEBHOOK_TOKEN so poking at debug tooling never risks the
-# live webhook token. Unset by default — the debug route 403s until this is
-# set in the environment.
-DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
 
 # Where we remember: (a) which Connecteam shift belongs to which Current RMS
 # opportunity_item (so we UPDATE instead of duplicating), and (b) how far
@@ -563,9 +565,9 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
 
         # Current RMS's free-text description on the Service line item (e.g.
         # "Bump in Day 1") — confirmed live via /debug/inspect-service-items
-        # against real service items. Shown verbatim in the Connecteam
-        # shift's notes field so crew see what the line item is actually
-        # for, not just the order title.
+        # against real service items. Written verbatim into the "Shift
+        # Type/Notes" custom field (not the shift notes field) so crew see
+        # what the line item is actually for.
         description = (service.get("description") or "").strip()
 
         key = str(service["id"])
@@ -590,15 +592,19 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         custom_fields.append(
             {"customFieldId": CONNECTEAM_QTY_CUSTOM_FIELD_ID, "value": str(quantity)}
         )
-
-        notes_html = (
-            f"<p>Auto-created from Current RMS order "
-            f"{opportunity.get('number', opportunity['id'])} "
-            f"(opportunity item #{service['id']}).</p>"
+        custom_fields.append(
+            {"customFieldId": CONNECTEAM_SHIFT_TYPE_CUSTOM_FIELD_ID, "value": description}
         )
-        if description:
-            notes_html += f"<p>{html.escape(description)}</p>"
-        notes = [{"html": notes_html}]
+
+        notes = [
+            {
+                "html": (
+                    f"<p>Auto-created from Current RMS order "
+                    f"{opportunity.get('number', opportunity['id'])} "
+                    f"(opportunity item #{service['id']}).</p>"
+                )
+            }
+        ]
 
         existing = shifts_state.get(key)
         if existing is None:
@@ -781,58 +787,6 @@ async def manual_sync(token: str | None = None):
     if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
         raise HTTPException(status_code=403, detail="invalid or missing token")
     result = await asyncio.to_thread(poll_all_open_orders)
-    return JSONResponse(result)
-
-
-@app.get("/debug/list-schedulers")
-async def debug_list_schedulers(token: str | None = None):
-    """TEMPORARY, read-only. Lists every Connecteam scheduler visible to
-    this API key (id, name, archived flag, timezone) plus which
-    schedulerId this deployment is currently configured to write to, so we
-    can confirm which one CONNECTEAM_SCHEDULER_ID actually points at."""
-    if not DEBUG_TOKEN or not hmac.compare_digest(token or "", DEBUG_TOKEN):
-        raise HTTPException(status_code=403, detail="invalid or missing token")
-
-    def _run() -> dict[str, Any]:
-        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
-        with httpx.Client(timeout=30) as client:
-            resp = client.get(f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers", headers=headers)
-            resp.raise_for_status()
-            return {
-                "configured_scheduler_id": CONNECTEAM_SCHEDULER_ID,
-                "configured_job_prefix": CONNECTEAM_JOB_PREFIX,
-                "schedulers": resp.json()["data"]["schedulers"],
-            }
-
-    result = await asyncio.to_thread(_run)
-    return JSONResponse(result)
-
-
-@app.get("/debug/list-shift-custom-fields")
-async def debug_list_shift_custom_fields(token: str | None = None, scheduler_id: str | None = None):
-    """TEMPORARY, read-only. Lists a scheduler's shift custom field
-    definitions (id, name, type) so we can find the id of a field created
-    by hand in the Connecteam UI — custom field *definitions* can only be
-    created there, not via the public API. Defaults to
-    CONNECTEAM_SCHEDULER_ID; pass scheduler_id to check a different one.
-    Remove once the field id has been wired into the real mapping."""
-    if not DEBUG_TOKEN or not hmac.compare_digest(token or "", DEBUG_TOKEN):
-        raise HTTPException(status_code=403, detail="invalid or missing token")
-
-    target_scheduler_id = scheduler_id or CONNECTEAM_SCHEDULER_ID
-
-    def _run() -> dict[str, Any]:
-        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
-        with httpx.Client(timeout=30) as client:
-            resp = client.get(
-                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{target_scheduler_id}/custom-fields",
-                headers=headers,
-                params={"limit": 100},
-            )
-            resp.raise_for_status()
-            return {"scheduler_id": target_scheduler_id, **resp.json()}
-
-    result = await asyncio.to_thread(_run)
     return JSONResponse(result)
 
 
