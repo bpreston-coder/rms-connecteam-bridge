@@ -109,6 +109,11 @@ CONNECTEAM_SHIFT_TYPE_CUSTOM_FIELD_ID = int(
 # an unscheduled full sync. Keep the URL itself private too.
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 
+# Separate shared secret for the temporary /backfill endpoint below, kept
+# distinct from WEBHOOK_TOKEN so a one-off admin action never risks the
+# live webhook token. Unset by default — the route 403s until this is set.
+BACKFILL_TOKEN = os.environ.get("BACKFILL_TOKEN", "")
+
 # Where we remember: (a) which Connecteam shift belongs to which Current RMS
 # opportunity_item (so we UPDATE instead of duplicating), and (b) how far
 # back the last poll checked, so the next poll only looks at what changed.
@@ -787,6 +792,44 @@ async def manual_sync(token: str | None = None):
     if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
         raise HTTPException(status_code=403, detail="invalid or missing token")
     result = await asyncio.to_thread(poll_all_open_orders)
+    return JSONResponse(result)
+
+
+@app.get("/backfill")
+async def backfill(token: str | None = None):
+    """TEMPORARY, one-off. Resyncs every current Order/Quotation-state
+    opportunity regardless of when it was last updated in Current RMS, so
+    already-existing shifts pick up mapping changes (e.g. the new "Shift
+    Type/Notes" custom field) without waiting for someone to edit that
+    order. Unlike /sync, this does NOT read or advance the poll cursor, so
+    the normal background poll's incremental window is unaffected either
+    way. Protected by its own BACKFILL_TOKEN (separate from WEBHOOK_TOKEN).
+    Remove this route once the backfill has been run and confirmed."""
+    if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        with sync_lock:
+            state = _load_state()
+            results: dict[str, Any] = {}
+            with httpx.Client(timeout=30) as client:
+                # Deliberately far back so every current Order/Quotation
+                # opportunity is included, not just ones changed recently.
+                opportunity_ids = fetch_opportunities_updated_since(client, "2000-01-01T00:00:00Z")
+                for opportunity_id in opportunity_ids:
+                    try:
+                        results[str(opportunity_id)] = sync_opportunity(client, opportunity_id, state)
+                    except httpx.HTTPStatusError as exc:
+                        log.exception("Backfill failed for opportunity %s", opportunity_id)
+                        results[str(opportunity_id)] = {
+                            "status": "error",
+                            "detail": f"{exc.response.status_code} {exc.response.text[:300]}",
+                        }
+            _save_state(state)
+        return {"checked": len(results), "results": results}
+
+    result = await asyncio.to_thread(_run)
+    log.info("Backfill checked %d opportunit(y/ies)", result["checked"])
     return JSONResponse(result)
 
 
