@@ -784,6 +784,30 @@ async def manual_sync(token: str | None = None):
     return JSONResponse(result)
 
 
+@app.get("/debug/list-schedulers")
+async def debug_list_schedulers(token: str | None = None):
+    """TEMPORARY, read-only. Lists every Connecteam scheduler visible to
+    this API key (id, name, archived flag, timezone) plus which
+    schedulerId this deployment is currently configured to write to, so we
+    can confirm which one CONNECTEAM_SCHEDULER_ID actually points at."""
+    if not DEBUG_TOKEN or not hmac.compare_digest(token or "", DEBUG_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        with httpx.Client(timeout=30) as client:
+            resp = client.get(f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers", headers=headers)
+            resp.raise_for_status()
+            return {
+                "configured_scheduler_id": CONNECTEAM_SCHEDULER_ID,
+                "configured_job_prefix": CONNECTEAM_JOB_PREFIX,
+                "schedulers": resp.json()["data"]["schedulers"],
+            }
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
 @app.get("/debug/list-shift-custom-fields")
 async def debug_list_shift_custom_fields(token: str | None = None):
     """TEMPORARY, read-only. Lists this scheduler's shift custom field
