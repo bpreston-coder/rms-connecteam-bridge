@@ -381,6 +381,18 @@ def find_job_by_service_name(
     return job_id
 
 
+def _is_stale_job_id_error(exc: httpx.HTTPStatusError) -> bool:
+    """True if Connecteam rejected a shift create/update because a cached
+    Job ID no longer exists (e.g. the Job was deleted/archived in
+    Connecteam after find_job_by_service_name cached it). The title->jobId
+    cache only ever refreshes on a title *miss*, never revalidates a hit,
+    so a deleted Job's ID can sit there stale indefinitely. Triggers a
+    one-time forced cache refresh + retry rather than failing the whole
+    sync — see sync_opportunity."""
+    text = exc.response.text.lower()
+    return "job_id" in text and "does not exist" in text
+
+
 def get_job_color(job_id: str | None, jobs_state: dict[str, Any]) -> str | None:
     """Look up the current color of a Job from the cache populated by
     find_job_by_service_name. Returns None if unknown (job_id missing, or
@@ -530,6 +542,10 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     to_update: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     unchanged = 0
     skipped: list[tuple[str, str]] = []
+    # Service name per shift key, kept so a stale-Job-ID retry (see
+    # _is_stale_job_id_error below) can redo the title lookup after a forced
+    # cache refresh without re-walking the Current RMS service items.
+    service_name_by_key: dict[str, str] = {}
 
     for service in services:
         start = _to_epoch_seconds(service["starts_at"])
@@ -576,6 +592,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         description = (service.get("description") or "").strip()
 
         key = str(service["id"])
+        service_name_by_key[key] = service["name"]
         desired = {
             "opportunityId": opportunity_id,
             "startTime": start,
@@ -661,7 +678,45 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         for name, reason in skipped:
             log.warning("Skipped service '%s': %s", name, reason)
 
-    created_shifts = create_shifts(client, [p for _, p, _ in to_create])
+    def _force_refresh_job_cache() -> None:
+        by_title, by_jobid_color = _load_job_title_cache(client)
+        cache = job_title_cache.setdefault("by_title", {})
+        color_cache = job_title_cache.setdefault("by_jobid_color", {})
+        cache.clear()
+        cache.update(by_title)
+        color_cache.clear()
+        color_cache.update(by_jobid_color)
+
+    def _rebuild_job_fields(payload: dict[str, Any], desired: dict[str, Any], key: str) -> None:
+        prefix = CONNECTEAM_JOB_PREFIX.strip()
+        service_name = service_name_by_key[key]
+        title = f"{prefix} {service_name}" if prefix else service_name
+        job_id = job_title_cache.get("by_title", {}).get(title)
+        job_color = job_id and job_title_cache.get("by_jobid_color", {}).get(job_id)
+        payload.pop("jobId", None)
+        payload.pop("color", None)
+        if job_id:
+            payload["jobId"] = job_id
+        if job_color:
+            payload["color"] = job_color
+        desired["jobId"] = job_id
+        desired["color"] = job_color or None
+
+    try:
+        created_shifts = create_shifts(client, [p for _, p, _ in to_create])
+    except httpx.HTTPStatusError as exc:
+        if not _is_stale_job_id_error(exc):
+            raise
+        log.warning(
+            "Connecteam rejected shift creation for opportunity %s due to a stale cached Job ID — "
+            "forcing a Job cache refresh and retrying once",
+            opportunity_id,
+        )
+        _force_refresh_job_cache()
+        for key, payload, desired in to_create:
+            _rebuild_job_fields(payload, desired, key)
+        created_shifts = create_shifts(client, [p for _, p, _ in to_create])
+
     if len(created_shifts) != len(to_create):
         log.warning(
             "Created %d shifts but requested %d for opportunity %s — response ordering assumption may be wrong",
@@ -670,7 +725,21 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     for (key, _, desired), shift_obj in zip(to_create, created_shifts):
         shifts_state[key] = {"shiftId": shift_obj["id"], **desired}
 
-    updated_shifts = update_shifts(client, [p for _, p, _ in to_update])
+    try:
+        updated_shifts = update_shifts(client, [p for _, p, _ in to_update])
+    except httpx.HTTPStatusError as exc:
+        if not _is_stale_job_id_error(exc):
+            raise
+        log.warning(
+            "Connecteam rejected shift update for opportunity %s due to a stale cached Job ID — "
+            "forcing a Job cache refresh and retrying once",
+            opportunity_id,
+        )
+        _force_refresh_job_cache()
+        for key, payload, desired in to_update:
+            _rebuild_job_fields(payload, desired, key)
+        updated_shifts = update_shifts(client, [p for _, p, _ in to_update])
+
     for key, _, desired in to_update:
         existing = shifts_state.get(key, {})
         existing.update(desired)
@@ -796,7 +865,7 @@ async def manual_sync(token: str | None = None):
 
 
 @app.get("/backfill")
-async def backfill(token: str | None = None):
+async def backfill(token: str | None = None, ids: str | None = None):
     """TEMPORARY, one-off. Resyncs every current Order/Quotation-state
     opportunity regardless of when it was last updated in Current RMS, so
     already-existing shifts pick up mapping changes (e.g. the new "Shift
@@ -804,7 +873,10 @@ async def backfill(token: str | None = None):
     order. Unlike /sync, this does NOT read or advance the poll cursor, so
     the normal background poll's incremental window is unaffected either
     way. Protected by its own BACKFILL_TOKEN (separate from WEBHOOK_TOKEN).
-    Remove this route once the backfill has been run and confirmed."""
+    Pass ?ids=3108,3898 to scope the run to specific opportunity IDs (e.g.
+    retrying only the ones that failed a prior full run) instead of
+    scanning every open opportunity. Remove this route once the backfill
+    has been run and confirmed."""
     if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
         raise HTTPException(status_code=403, detail="invalid or missing token")
 
@@ -813,9 +885,12 @@ async def backfill(token: str | None = None):
             state = _load_state()
             results: dict[str, Any] = {}
             with httpx.Client(timeout=30) as client:
-                # Deliberately far back so every current Order/Quotation
-                # opportunity is included, not just ones changed recently.
-                opportunity_ids = fetch_opportunities_updated_since(client, "2000-01-01T00:00:00Z")
+                if ids:
+                    opportunity_ids = [int(x.strip()) for x in ids.split(",") if x.strip()]
+                else:
+                    # Deliberately far back so every current Order/Quotation
+                    # opportunity is included, not just ones changed recently.
+                    opportunity_ids = fetch_opportunities_updated_since(client, "2000-01-01T00:00:00Z")
                 for opportunity_id in opportunity_ids:
                     try:
                         results[str(opportunity_id)] = sync_opportunity(client, opportunity_id, state)
