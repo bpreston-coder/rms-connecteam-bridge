@@ -874,6 +874,47 @@ async def manual_sync(token: str | None = None):
     return JSONResponse(result)
 
 
+@app.get("/debug/inspect-sync")
+async def debug_inspect_sync(opportunity_id: int, token: str | None = None):
+    """TEMPORARY, diagnostic only, no writes. User reports some shifts exist
+    in Connecteam but the "Shift Type/Notes" custom field is blank even
+    after a successful backfill. For each dated Service item on this
+    opportunity, returns the raw Current RMS description, the tracked state
+    entry (shiftId + last-synced description), and the LIVE Connecteam
+    shift's actual customFields — so we can tell apart "source description
+    is genuinely blank" from "we computed a value but never sent/received
+    it". Protected by BACKFILL_TOKEN (reused — diagnostic, not a write).
+    Remove this route once the mismatch is understood."""
+    if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        state = _load_state()
+        shifts_state: dict[str, Any] = state["shifts"]
+        with httpx.Client(timeout=30) as client:
+            services = fetch_service_items(client, opportunity_id)
+            rows = []
+            for service in services:
+                key = str(service["id"])
+                existing = shifts_state.get(key)
+                row: dict[str, Any] = {
+                    "service_item_id": service["id"],
+                    "service_name": service["name"],
+                    "raw_description": service.get("description"),
+                    "tracked_state": existing,
+                }
+                if existing and existing.get("shiftId"):
+                    shift = get_shift(client, existing["shiftId"])
+                    row["live_shift_customFields"] = (
+                        shift.get("customFields") if shift else "SHIFT NOT FOUND (404)"
+                    )
+                rows.append(row)
+            return {"opportunity_id": opportunity_id, "services": rows}
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
 @app.get("/backfill")
 async def backfill(token: str | None = None, ids: str | None = None):
     """TEMPORARY, one-off. Resyncs every current Order/Quotation-state
