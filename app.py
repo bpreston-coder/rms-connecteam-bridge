@@ -809,24 +809,28 @@ async def debug_list_schedulers(token: str | None = None):
 
 
 @app.get("/debug/list-shift-custom-fields")
-async def debug_list_shift_custom_fields(token: str | None = None):
-    """TEMPORARY, read-only. Lists this scheduler's shift custom field
-    definitions (id, title, type) so we can find the id of a field created
+async def debug_list_shift_custom_fields(token: str | None = None, scheduler_id: str | None = None):
+    """TEMPORARY, read-only. Lists a scheduler's shift custom field
+    definitions (id, name, type) so we can find the id of a field created
     by hand in the Connecteam UI — custom field *definitions* can only be
-    created there, not via the public API. Remove once the field id has
-    been wired into the real mapping."""
+    created there, not via the public API. Defaults to
+    CONNECTEAM_SCHEDULER_ID; pass scheduler_id to check a different one.
+    Remove once the field id has been wired into the real mapping."""
     if not DEBUG_TOKEN or not hmac.compare_digest(token or "", DEBUG_TOKEN):
         raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    target_scheduler_id = scheduler_id or CONNECTEAM_SCHEDULER_ID
 
     def _run() -> dict[str, Any]:
         headers = {"X-API-KEY": CONNECTEAM_API_KEY}
         with httpx.Client(timeout=30) as client:
             resp = client.get(
-                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/custom-fields/shifts",
+                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{target_scheduler_id}/custom-fields",
                 headers=headers,
+                params={"limit": 100},
             )
             resp.raise_for_status()
-            return resp.json()
+            return {"scheduler_id": target_scheduler_id, **resp.json()}
 
     result = await asyncio.to_thread(_run)
     return JSONResponse(result)
