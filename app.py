@@ -101,6 +101,12 @@ CONNECTEAM_QTY_CUSTOM_FIELD_ID = int(os.environ.get("CONNECTEAM_QTY_CUSTOM_FIELD
 # an unscheduled full sync. Keep the URL itself private too.
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 
+# Separate shared secret for the temporary /debug/* endpoint below, kept
+# distinct from WEBHOOK_TOKEN so poking at debug tooling never risks the
+# live webhook token. Unset by default — the debug route 403s until this is
+# set in the environment.
+DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
+
 # Where we remember: (a) which Connecteam shift belongs to which Current RMS
 # opportunity_item (so we UPDATE instead of duplicating), and (b) how far
 # back the last poll checked, so the next poll only looks at what changed.
@@ -775,6 +781,30 @@ async def manual_sync(token: str | None = None):
     if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
         raise HTTPException(status_code=403, detail="invalid or missing token")
     result = await asyncio.to_thread(poll_all_open_orders)
+    return JSONResponse(result)
+
+
+@app.get("/debug/list-shift-custom-fields")
+async def debug_list_shift_custom_fields(token: str | None = None):
+    """TEMPORARY, read-only. Lists this scheduler's shift custom field
+    definitions (id, title, type) so we can find the id of a field created
+    by hand in the Connecteam UI — custom field *definitions* can only be
+    created there, not via the public API. Remove once the field id has
+    been wired into the real mapping."""
+    if not DEBUG_TOKEN or not hmac.compare_digest(token or "", DEBUG_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        with httpx.Client(timeout=30) as client:
+            resp = client.get(
+                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/custom-fields/shifts",
+                headers=headers,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    result = await asyncio.to_thread(_run)
     return JSONResponse(result)
 
 
