@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import html
 import json
 import logging
 import os
@@ -99,12 +100,6 @@ CONNECTEAM_QTY_CUSTOM_FIELD_ID = int(os.environ.get("CONNECTEAM_QTY_CUSTOM_FIELD
 # webhook endpoint — it's also required for /sync so randoms can't trigger
 # an unscheduled full sync. Keep the URL itself private too.
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
-
-# Separate shared secret for the temporary /debug/* endpoints below, kept
-# distinct from WEBHOOK_TOKEN so poking at debug tooling never risks the
-# live webhook token. Unset by default — debug routes 403 until this is
-# set in the environment.
-DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
 
 # Where we remember: (a) which Connecteam shift belongs to which Current RMS
 # opportunity_item (so we UPDATE instead of duplicating), and (b) how far
@@ -560,6 +555,13 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         except (TypeError, ValueError):
             quantity = 1
 
+        # Current RMS's free-text description on the Service line item (e.g.
+        # "Bump in Day 1") — confirmed live via /debug/inspect-service-items
+        # against real service items. Shown verbatim in the Connecteam
+        # shift's notes field so crew see what the line item is actually
+        # for, not just the order title.
+        description = (service.get("description") or "").strip()
+
         key = str(service["id"])
         desired = {
             "opportunityId": opportunity_id,
@@ -571,6 +573,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             "orderNumber": order_number,
             "address": address,
             "quantity": quantity,
+            "description": description,
         }
 
         custom_fields = []
@@ -582,6 +585,15 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             {"customFieldId": CONNECTEAM_QTY_CUSTOM_FIELD_ID, "value": str(quantity)}
         )
 
+        notes_html = (
+            f"<p>Auto-created from Current RMS order "
+            f"{opportunity.get('number', opportunity['id'])} "
+            f"(opportunity item #{service['id']}).</p>"
+        )
+        if description:
+            notes_html += f"<p>{html.escape(description)}</p>"
+        notes = [{"html": notes_html}]
+
         existing = shifts_state.get(key)
         if existing is None:
             payload: dict[str, Any] = {
@@ -589,15 +601,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
                 "endTime": end,
                 "title": title,
                 "isPublished": False,
-                "notes": [
-                    {
-                        "html": (
-                            f"<p>Auto-created from Current RMS order "
-                            f"{opportunity.get('number', opportunity['id'])} "
-                            f"(opportunity item #{service['id']}).</p>"
-                        )
-                    }
-                ],
+                "notes": notes,
                 "customFields": custom_fields,
             }
             if job_id:
@@ -616,12 +620,14 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             or existing.get("orderNumber") != order_number
             or existing.get("address") != address
             or existing.get("quantity") != quantity
+            or existing.get("description") != description
         ):
             update_payload: dict[str, Any] = {
                 "shiftId": existing["shiftId"],
                 "startTime": start,
                 "endTime": end,
                 "title": title,
+                "notes": notes,
                 "customFields": custom_fields,
             }
             if job_id:
@@ -769,85 +775,6 @@ async def manual_sync(token: str | None = None):
     if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
         raise HTTPException(status_code=403, detail="invalid or missing token")
     result = await asyncio.to_thread(poll_all_open_orders)
-    return JSONResponse(result)
-
-
-@app.get("/debug/inspect-service-items")
-async def debug_inspect_service_items(
-    token: str | None = None,
-    opportunity_id: int | None = None,
-    lookback_days: int = 90,
-    require_description: bool = False,
-    max_matches: int = 5,
-):
-    """TEMPORARY, read-only. Dumps the raw Current RMS opportunity_item JSON
-    for one or more Service line items so we can confirm the exact field
-    name that holds the item's free-text description (e.g. "Bump in")
-    before wiring up the Connecteam shift-notes mapping. Does not touch
-    Connecteam or the state file. Remove once the mapping is implemented
-    and confirmed live.
-
-    If opportunity_id is given, inspects that opportunity's Service items
-    directly. Otherwise scans Order/Quotation-state opportunities updated in
-    the last lookback_days. With require_description=true, keeps scanning
-    (instead of stopping at the first opportunity with any Service items)
-    and collects up to max_matches items whose "description" field is
-    actually non-empty, so we can see real text like "Bump in" rather than
-    confirming the field exists but is blank."""
-    if not DEBUG_TOKEN or not hmac.compare_digest(token or "", DEBUG_TOKEN):
-        raise HTTPException(status_code=403, detail="invalid or missing token")
-
-    def _run() -> dict[str, Any]:
-        with httpx.Client(timeout=30) as client:
-            if opportunity_id is not None:
-                candidate_ids = [opportunity_id]
-            else:
-                since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
-                candidate_ids = fetch_opportunities_updated_since(client, since)
-
-            if require_description:
-                matches: list[dict[str, Any]] = []
-                opportunities_checked = 0
-                for oid in candidate_ids:
-                    opportunities_checked += 1
-                    try:
-                        items = fetch_service_items(client, oid)
-                    except httpx.HTTPStatusError:
-                        continue
-                    for item in items:
-                        if (item.get("description") or "").strip():
-                            matches.append({"opportunity_id": oid, "item": item})
-                            if len(matches) >= max_matches:
-                                return {
-                                    "opportunities_checked": opportunities_checked,
-                                    "match_count": len(matches),
-                                    "matches": matches,
-                                }
-                return {
-                    "opportunities_checked": opportunities_checked,
-                    "match_count": len(matches),
-                    "matches": matches,
-                }
-
-            for oid in candidate_ids:
-                try:
-                    items = fetch_service_items(client, oid)
-                except httpx.HTTPStatusError:
-                    continue
-                if items:
-                    return {
-                        "opportunity_id": oid,
-                        "service_item_count": len(items),
-                        "sample_items": items[:3],
-                    }
-
-            return {
-                "opportunity_id": None,
-                "checked": len(candidate_ids),
-                "detail": "no opportunity with dated Service items found in range",
-            }
-
-    result = await asyncio.to_thread(_run)
     return JSONResponse(result)
 
 
