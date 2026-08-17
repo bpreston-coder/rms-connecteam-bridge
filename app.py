@@ -28,6 +28,11 @@ Current RMS opportunity_item's ID:
   - Same teardown applies at the individual item level: if one service line
     item is removed from an opportunity that's still otherwise eligible,
     only that item's shift is cleaned up (draft deleted / published left).
+  - A Service line item spanning more than one Australia/Perth calendar day
+    becomes one shift PER calendar day it touches (see
+    _split_into_daily_segments), each independently created/updated/deleted
+    by opportunity_item-id + day-index. Beyond MAX_SHIFT_SPAN_DAYS calendar
+    days it's skipped instead, the same as an unschedulable time range.
   - Whenever a published shift is left in place instead of deleted, or gets
     edited in place because Current RMS changed under it, ops is notified
     in Google Chat (see notify_ops / GOOGLE_CHAT_WEBHOOK_URL) so a human
@@ -168,6 +173,17 @@ GOOGLE_CHAT_WEBHOOK_URL = os.environ.get("GOOGLE_CHAT_WEBHOOK_URL", "")
 STATE_FILE = Path(os.environ.get("STATE_FILE", "./processed_orders.json"))
 
 MAX_SHIFT_SECONDS = 24 * 60 * 60  # Connecteam: a shift can't exceed 24h.
+
+# A Service line item spanning more than one calendar day becomes one shift
+# PER Australia/Perth calendar day it touches (see _split_into_daily_segments)
+# instead of one shift skipped outright for exceeding MAX_SHIFT_SECONDS.
+# Perth (AWST) is fixed UTC+8 year-round — no DST to account for. Confirmed
+# with the user 2026-08-17. Beyond MAX_SHIFT_SPAN_DAYS calendar days, a
+# service goes back to being skipped (with a warning) rather than split —
+# guards against turning a genuinely long equipment-only booking (weeks or
+# months) into that many daily shifts.
+PERTH_TZ = timezone(timedelta(hours=8))
+MAX_SHIFT_SPAN_DAYS = 14
 
 # Background poll: catches Service-item edits made *after* conversion (no
 # Current RMS webhook fires for those). Runs every POLL_INTERVAL_SECONDS.
@@ -349,6 +365,34 @@ def _to_epoch_seconds(iso_ts: str) -> int:
 
 def _format_epoch(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%a %d %b %Y, %H:%M UTC")
+
+
+def _split_into_daily_segments(start: int, end: int) -> list[tuple[int, int]] | None:
+    """Split [start, end) (unix epoch seconds, end already confirmed > start
+    by the caller) into one segment per Australia/Perth calendar day it
+    touches — e.g. Fri 22:00 -> Sun 06:00 AWST becomes [Fri 22:00->midnight,
+    Sat 00:00->24:00, Sun 00:00->06:00]. A same-day span returns a single
+    segment identical to the input. Returns None if the span covers more
+    than MAX_SHIFT_SPAN_DAYS calendar days — caller should skip instead of
+    splitting into that many shifts."""
+    start_dt = datetime.fromtimestamp(start, tz=PERTH_TZ)
+    end_dt = datetime.fromtimestamp(end, tz=PERTH_TZ)
+    start_day = start_dt.date()
+    end_day = end_dt.date()
+    if (end_day - start_day).days + 1 > MAX_SHIFT_SPAN_DAYS:
+        return None
+
+    segments: list[tuple[int, int]] = []
+    cursor = start
+    day = start_day
+    while day <= end_day:
+        next_midnight = datetime(day.year, day.month, day.day, tzinfo=PERTH_TZ) + timedelta(days=1)
+        day_end = min(end, int(next_midnight.timestamp()))
+        if day_end > cursor:
+            segments.append((cursor, day_end))
+        cursor = day_end
+        day += timedelta(days=1)
+    return segments
 
 
 def _load_job_title_cache(client: httpx.Client) -> tuple[dict[str, str], dict[str, str]]:
@@ -612,6 +656,39 @@ def cleanup_ineligible_opportunity(
 # Core sync — idempotent, keyed off Current RMS opportunity_item IDs
 # ---------------------------------------------------------------------------
 
+def _expand_service_segments(
+    services: list[dict[str, Any]],
+) -> tuple[list[tuple[str, dict[str, Any], int, int]], list[tuple[str, str]]]:
+    """Turn each dated Service line item into one or more (key, service,
+    start, end) rows — one per Australia/Perth calendar day it spans (see
+    _split_into_daily_segments). A same-day item keeps its plain
+    str(service["id"]) key, unchanged from before day-splitting existed, so
+    already-tracked single-day shifts are never mistaken for orphans or
+    recreated under a new key; a multi-day item's per-day rows get
+    "{id}:{day_index}" keys instead. Returns (expanded, skipped) — skipped
+    covers items that can't be scheduled at all (bad times, or a span
+    longer than MAX_SHIFT_SPAN_DAYS calendar days)."""
+    expanded: list[tuple[str, dict[str, Any], int, int]] = []
+    skipped: list[tuple[str, str]] = []
+    for service in services:
+        start = _to_epoch_seconds(service["starts_at"])
+        end = _to_epoch_seconds(service["ends_at"])
+        if end <= start:
+            skipped.append((service["name"], "end time is not after start time"))
+            continue
+
+        segments = _split_into_daily_segments(start, end)
+        if segments is None:
+            skipped.append((service["name"], f"span exceeds {MAX_SHIFT_SPAN_DAYS}-day split cap"))
+            continue
+
+        single_day = len(segments) == 1
+        for day_index, (seg_start, seg_end) in enumerate(segments):
+            key = str(service["id"]) if single_day else f"{service['id']}:{day_index}"
+            expanded.append((key, service, seg_start, seg_end))
+    return expanded, skipped
+
+
 def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str, Any]) -> dict[str, Any]:
     """Create/update draft Connecteam shifts for one order, and its linked
     Job. Mutates `state` in place; caller is responsible for persisting it.
@@ -632,7 +709,12 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     # no longer shows up here — deleted from the opportunity, or had its
     # dates cleared — is torn down the same way a whole ineligible
     # opportunity is: draft deleted, published left + Chat notification.
-    current_keys = {str(service["id"]) for service in services}
+    # Same applies to a single-day-turned-multi-day (or vice versa) item's
+    # now-stale key, since _expand_service_segments changes key format
+    # between the two cases — current_keys covers every key that SHOULD
+    # exist right now, split or not.
+    expanded_segments, segment_skips = _expand_service_segments(services)
+    current_keys = {key for key, _, _, _ in expanded_segments}
     orphaned_keys = [
         k
         for k, v in shifts_state.items()
@@ -663,23 +745,13 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     to_create: list[tuple[str, dict[str, Any], dict[str, Any]]] = []  # (key, payload, desired)
     to_update: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     unchanged = 0
-    skipped: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str]] = list(segment_skips)
     # Service name per shift key, kept so a stale-Job-ID retry (see
     # _is_stale_job_id_error below) can redo the title lookup after a forced
     # cache refresh without re-walking the Current RMS service items.
     service_name_by_key: dict[str, str] = {}
 
-    for service in services:
-        start = _to_epoch_seconds(service["starts_at"])
-        end = _to_epoch_seconds(service["ends_at"])
-
-        if end <= start:
-            skipped.append((service["name"], "end time is not after start time"))
-            continue
-        if end - start > MAX_SHIFT_SECONDS:
-            skipped.append((service["name"], "duration exceeds Connecteam's 24h shift limit"))
-            continue
-
+    for key, service, start, end in expanded_segments:
         # Job = task type, matched by Service name (e.g. "Lighting
         # Technician") — never created per-order. The opportunity name only
         # ever goes into the shift title text, per the corrected design.
@@ -713,7 +785,6 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         # what the line item is actually for.
         description = (service.get("description") or "").strip()
 
-        key = str(service["id"])
         service_name_by_key[key] = service["name"]
         desired = {
             "opportunityId": opportunity_id,
@@ -1063,13 +1134,16 @@ async def debug_inspect_sync(opportunity_id: int, token: str | None = None):
         shifts_state: dict[str, Any] = state["shifts"]
         with httpx.Client(timeout=30) as client:
             services = fetch_service_items(client, opportunity_id)
+            expanded_segments, _ = _expand_service_segments(services)
             rows = []
-            for service in services:
-                key = str(service["id"])
+            for key, service, seg_start, seg_end in expanded_segments:
                 existing = shifts_state.get(key)
                 row: dict[str, Any] = {
+                    "key": key,
                     "service_item_id": service["id"],
                     "service_name": service["name"],
+                    "segment_start": seg_start,
+                    "segment_end": seg_end,
                     "raw_description": service.get("description"),
                     "tracked_state": existing,
                 }
