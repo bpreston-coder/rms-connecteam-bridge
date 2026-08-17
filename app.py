@@ -1050,44 +1050,6 @@ async def debug_inspect_sync(opportunity_id: int, token: str | None = None):
     return JSONResponse(result)
 
 
-@app.get("/debug/list-jobs")
-async def debug_list_jobs(token: str | None = None):
-    """TEMPORARY, diagnostic only, no writes. Returns every non-deleted/
-    non-archived Connecteam Job in this scheduler (id, title, color) so it
-    can be checked against the Current RMS Service catalog and mapped by
-    name (see find_job_by_service_name / CONNECTEAM_JOB_PREFIX). Protected
-    by BACKFILL_TOKEN (reused — diagnostic, not a write). Remove this route
-    once the service<->Job mapping review is done."""
-    if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
-        raise HTTPException(status_code=403, detail="invalid or missing token")
-
-    def _run() -> dict[str, Any]:
-        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
-        jobs: list[dict[str, Any]] = []
-        offset = 0
-        with httpx.Client(timeout=30) as client:
-            while True:
-                resp = client.get(
-                    f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
-                    headers=headers,
-                    params={"instanceIds": CONNECTEAM_SCHEDULER_ID, "limit": 500, "offset": offset},
-                )
-                resp.raise_for_status()
-                body = resp.json()
-                page_jobs = body.get("data", {}).get("jobs", [])
-                for j in page_jobs:
-                    if j.get("isDeleted") or j.get("isArchived"):
-                        continue
-                    jobs.append({"jobId": j.get("jobId"), "title": j.get("title"), "color": j.get("color")})
-                if len(page_jobs) < 500:
-                    break
-                offset = body.get("paging", {}).get("offset", offset + 500)
-        return {"scheduler_id": CONNECTEAM_SCHEDULER_ID, "job_prefix": CONNECTEAM_JOB_PREFIX, "jobs": jobs}
-
-    result = await asyncio.to_thread(_run)
-    return JSONResponse(result)
-
-
 @app.get("/backfill")
 async def backfill(token: str | None = None, ids: str | None = None):
     """TEMPORARY, one-off. Resyncs every current Order/Quotation-state
