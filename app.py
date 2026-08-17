@@ -1129,6 +1129,62 @@ async def backfill(token: str | None = None, ids: str | None = None):
     return JSONResponse(result)
 
 
+@app.get("/debug/list-shifts")
+async def debug_list_shifts(
+    title_contains: str,
+    start: str,
+    end: str,
+    token: str | None = None,
+):
+    """TEMPORARY, diagnostic only, no writes. Lists every LIVE Connecteam
+    shift in [start, end) (ISO 8601) whose title contains `title_contains`
+    — for spotting duplicate shifts that aren't both in the tracked state
+    file (e.g. one is tracked, one is an untracked leftover). Protected by
+    BACKFILL_TOKEN. Remove this route once the investigation is done."""
+    if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    start_ts = int(datetime.fromisoformat(start.replace("Z", "+00:00")).timestamp())
+    end_ts = int(datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp())
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        shifts: list[dict[str, Any]] = []
+        offset = 0
+        with httpx.Client(timeout=30) as client:
+            while True:
+                resp = client.get(
+                    f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+                    headers=headers,
+                    params={"startTime": start_ts, "endTime": end_ts, "limit": 500, "offset": offset},
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                batch = body.get("data", {}).get("shifts", [])
+                shifts.extend(batch)
+                if len(batch) < 500:
+                    break
+                offset = body.get("paging", {}).get("offset", offset + 500)
+
+        matches = [
+            {
+                "id": s.get("id"),
+                "title": s.get("title"),
+                "startTime": s.get("startTime"),
+                "endTime": s.get("endTime"),
+                "jobId": s.get("jobId"),
+                "isPublished": s.get("isPublished"),
+                "customFields": s.get("customFields"),
+            }
+            for s in shifts
+            if title_contains.lower() in (s.get("title") or "").lower()
+        ]
+        return {"matched_count": len(matches), "shifts": matches}
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
