@@ -83,6 +83,37 @@ CONNECTEAM_BASE_URL = os.environ.get("CONNECTEAM_BASE_URL", "https://api.connect
 # apart from anything real. Clear this env var when pointed at production.
 CONNECTEAM_JOB_PREFIX = os.environ.get("CONNECTEAM_JOB_PREFIX", "")
 
+# Some Current RMS Service names don't map 1:1 onto a Connecteam Job — either
+# because several distinct RMS services (e.g. daytime/overnight variants, or
+# per-city/per-distance-type variants) are meant to share ONE task-type Job,
+# or because the Job title in Connecteam has just diverged from the RMS
+# service name over time. Reviewed and confirmed with the user 2026-08-17
+# against the live Current RMS Service catalog and Connecteam Jobs list.
+# Keys are the exact Current RMS service["name"]; values are the exact
+# Connecteam Job title to look up instead. Services not listed here use
+# their own name unchanged (the historical 1:1 behavior).
+SERVICE_JOB_OVERRIDES: dict[str, str] = {
+    "Audio Engineer - FOH - Overnight 0000 - 0700 and Sunday": "Audio Engineer - FOH",
+    "Audio Engineer - MONS - Overnight 0000 - 0700 and Sunday": "Audio Engineer - MONS",
+    "Audio Engineer - Systems - Overnight 0000 - 0700 and Sunday": "Audio Engineer - Systems",
+    "Followspot operator - Overnight 0000 - 0700 and Sunday": "Follow spot operator",
+    "Lighting operator - Overnight 0000 - 0700 and Sunday": "Lighting Operator",
+    "Lighting system's technician - Overnight 0000 - 0700 and Sunday": "Lighting system's technician",
+    "Lighting technician - Overnight 0000 - 0700 and Sunday": "Lighting technician",
+    "Production manager - Overnight 0000 - 0700 and Sunday": "Production manager",
+    "Rigger - Overnight 0000 - 0700 and Sunday": "Rigger",
+    "Truck 8 Ton - Collection (Distance)": "Truck 8 Ton - Collection",
+    "Truck 8 Ton - Delivery (Distance)": "Truck 8 Ton - Delivery",
+    "Truck 8 Ton - Perth Collection": "Truck 8 Ton - Collection",
+    "Truck 8 Ton - Perth Collection (After hours and Weekend)": "Truck 8 Ton - Collection",
+    "Truck 8 Ton - Perth Delivery": "Truck 8 Ton - Delivery",
+    "Truck 8 Ton - Perth Delivery (After hours and Weekend)": "Truck 8 Ton - Delivery",
+    "Van 1 Ton Perth Collection": "Van 1 Ton Collection",
+    "Van 1 Ton Perth Collection  (After hours and Weekend)": "Van 1 Ton Collection",
+    "Van 1 Ton Perth Delivery": "Van 1 Ton Delivery",
+    "Van 1 Ton Perth Delivery (After hours and Weekend)": "Van 1 Ton Delivery",
+}
+
 # Shift custom field id for the "Job No." box in the shift editor (renamed
 # to "Opportunity No." by the user in the test schedule's UI). Captured live
 # from Connecteam's own web app request when saving that field on a shift —
@@ -363,19 +394,22 @@ def find_job_by_service_name(
     client: httpx.Client, service_name: str, jobs_state: dict[str, Any]
 ) -> str | None:
     """Look up the task-type Job whose title is
-    f"{CONNECTEAM_JOB_PREFIX}{service_name}" (e.g. "TEST Lighting
-    Technician" while testing, or just "Lighting Technician" in
-    production). Returns None — and logs a warning — if no matching Job
+    f"{CONNECTEAM_JOB_PREFIX}{SERVICE_JOB_OVERRIDES.get(service_name, service_name)}"
+    (e.g. "TEST Lighting Technician" while testing, or just "Lighting
+    Technician" in production) — most services map onto a Job of the same
+    name, but SERVICE_JOB_OVERRIDES redirects the handful that don't (see
+    its comment). Returns None — and logs a warning — if no matching Job
     exists; it does NOT create one. jobs_state is a title->jobId cache
     persisted in the state file so repeated syncs don't refetch the whole
     Jobs list every time."""
+    mapped_name = SERVICE_JOB_OVERRIDES.get(service_name, service_name)
     # Built with an explicit space rather than relying on a trailing space
     # surviving inside CONNECTEAM_JOB_PREFIX itself — env var UIs (Render
     # included) tend to silently trim trailing whitespace on save, which
     # would otherwise turn "TEST Lighting technician" into
     # "TESTLighting technician" and break every lookup.
     prefix = CONNECTEAM_JOB_PREFIX.strip()
-    title = f"{prefix} {service_name}" if prefix else service_name
+    title = f"{prefix} {mapped_name}" if prefix else mapped_name
 
     cache: dict[str, str] = jobs_state.setdefault("by_title", {})
     color_cache: dict[str, str] = jobs_state.setdefault("by_jobid_color", {})
@@ -778,7 +812,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     def _rebuild_job_fields(payload: dict[str, Any], desired: dict[str, Any], key: str) -> None:
         prefix = CONNECTEAM_JOB_PREFIX.strip()
         service_name = service_name_by_key[key]
-        title = f"{prefix} {service_name}" if prefix else service_name
+        mapped_name = SERVICE_JOB_OVERRIDES.get(service_name, service_name)
+        title = f"{prefix} {mapped_name}" if prefix else mapped_name
         job_id = job_title_cache.get("by_title", {}).get(title)
         job_color = job_id and job_title_cache.get("by_jobid_color", {}).get(job_id)
         payload.pop("jobId", None)
