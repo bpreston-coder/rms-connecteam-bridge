@@ -20,9 +20,18 @@ Current RMS opportunity_item's ID:
   - If we've already created a shift for that item -> UPDATE that same
     shift in place if the title/time/job/quantity changed, otherwise do
     nothing.
-  - If the opportunity is no longer eligible (flag unticked, or it went
-    dead/lost/reverted) -> DELETE any shifts we created that are still
-    draft; leave already-published shifts alone for manual review.
+  - If the opportunity is no longer eligible (flag unticked, went dead/
+    lost/reverted, or was deleted outright — including a deletion the poll
+    discovers as a 404, not just one caught by webhook) -> DELETE any
+    shifts we created that are still draft; leave already-published shifts
+    alone for manual review.
+  - Same teardown applies at the individual item level: if one service line
+    item is removed from an opportunity that's still otherwise eligible,
+    only that item's shift is cleaned up (draft deleted / published left).
+  - Whenever a published shift is left in place instead of deleted, or gets
+    edited in place because Current RMS changed under it, ops is notified
+    in Google Chat (see notify_ops / GOOGLE_CHAT_WEBHOOK_URL) so a human
+    knows to check on a shift crew may already have been told about.
 This guarantees we never create duplicate shifts, no matter how many times
 an opportunity is processed (webhook retries, overlapping polls, re-
 conversions), and never silently blow away a shift someone has published.
@@ -113,6 +122,14 @@ WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 # distinct from WEBHOOK_TOKEN so a one-off admin action never risks the
 # live webhook token. Unset by default — the route 403s until this is set.
 BACKFILL_TOKEN = os.environ.get("BACKFILL_TOKEN", "")
+
+# Incoming webhook URL for the ops Google Chat space. Posted to whenever a
+# shift a human already published gets left in place during cleanup (would
+# otherwise have been deleted) or gets edited by the sync — both cases where
+# a real person may have already told crew about that shift. Unset by
+# default: notify_ops() just logs and no-ops rather than failing sync, so
+# this is safe to leave unconfigured in test.
+GOOGLE_CHAT_WEBHOOK_URL = os.environ.get("GOOGLE_CHAT_WEBHOOK_URL", "")
 
 # Where we remember: (a) which Connecteam shift belongs to which Current RMS
 # opportunity_item (so we UPDATE instead of duplicating), and (b) how far
@@ -445,6 +462,20 @@ def update_shifts(client: httpx.Client, payloads: list[dict[str, Any]]) -> list[
     return updated
 
 
+def notify_ops(client: httpx.Client, text: str) -> None:
+    """Post a message to the ops Google Chat space. Best-effort: logs and
+    swallows failures instead of raising, so a Chat outage never breaks a
+    sync that otherwise succeeded."""
+    if not GOOGLE_CHAT_WEBHOOK_URL:
+        log.warning("GOOGLE_CHAT_WEBHOOK_URL not set — skipping ops notification: %s", text)
+        return
+    try:
+        resp = client.post(GOOGLE_CHAT_WEBHOOK_URL, json={"text": text})
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        log.exception("Failed to post ops notification to Google Chat: %s", text)
+
+
 def get_shift(client: httpx.Client, shift_id: str) -> dict[str, Any] | None:
     """Fetch a single shift; returns None if it no longer exists (e.g.
     already deleted by hand in Connecteam)."""
@@ -471,21 +502,19 @@ def delete_shift(client: httpx.Client, shift_id: str) -> None:
         resp.raise_for_status()
 
 
-def cleanup_ineligible_opportunity(
-    client: httpx.Client, opportunity_id: int, reason: str, state: dict[str, Any]
+def _cleanup_shift_keys(
+    client: httpx.Client,
+    keys: list[str],
+    shifts_state: dict[str, Any],
+    opportunity_id: int,
+    reason: str,
 ) -> dict[str, Any]:
-    """An opportunity that used to be eligible (Order, or flagged Quotation)
-    no longer is — flag was unticked, or it went dead/lost/reverted.
-    Draft (unpublished) shifts we created for it are deleted automatically.
-    Published shifts are left alone — a human has already put real
-    scheduling work into a published shift, so this only deletes what's
-    still safely a draft. (Notifying ops about left-behind published shifts
-    is planned but not wired up yet.)"""
-    shifts_state: dict[str, Any] = state["shifts"]
-    keys = [k for k, v in shifts_state.items() if v.get("opportunityId") == opportunity_id]
-    if not keys:
-        return {"status": "skipped", "reason": reason, "tracked_shifts": 0}
-
+    """Shared teardown for a set of tracked shift keys that should no longer
+    exist (whole opportunity ineligible, or an individual service item gone
+    from an opportunity that's otherwise still eligible). Draft shifts are
+    deleted outright. A shift a human already published is left in place —
+    real scheduling work has gone into it — but ops gets a Google Chat ping
+    since without this bridge would have deleted it."""
     deleted = 0
     left_published = 0
     already_gone = 0
@@ -499,9 +528,18 @@ def cleanup_ineligible_opportunity(
         if shift.get("isPublished"):
             left_published += 1
             log.warning(
-                "Opportunity %s is no longer eligible (%s) but shift %s is already published — "
+                "Opportunity %s, shift %s should be removed (%s) but is already published — "
                 "leaving it in place for manual review.",
-                opportunity_id, reason, shift_id,
+                opportunity_id, shift_id, reason,
+            )
+            order_number = shifts_state[key].get("orderNumber")
+            title = shifts_state[key].get("title")
+            notify_ops(
+                client,
+                f"⚠️ Published Connecteam shift needs manual review.\n"
+                f"Opportunity {opportunity_id} (order {order_number}) — {reason}.\n"
+                f"Shift \"{title}\" ({shift_id}) is already published, so the bridge left it in place "
+                f"instead of deleting it. Please review/cancel it in Connecteam.",
             )
             continue
         delete_shift(client, shift_id)
@@ -509,13 +547,27 @@ def cleanup_ineligible_opportunity(
         del shifts_state[key]
 
     return {
-        "status": "cleaned_up",
-        "reason": reason,
         "tracked_shifts": len(keys),
         "deleted_draft_count": deleted,
         "left_published_count": left_published,
         "already_gone_count": already_gone,
     }
+
+
+def cleanup_ineligible_opportunity(
+    client: httpx.Client, opportunity_id: int, reason: str, state: dict[str, Any]
+) -> dict[str, Any]:
+    """An opportunity that used to be eligible (Order, or flagged Quotation)
+    no longer is — flag was unticked, it went dead/lost/reverted, or it was
+    deleted outright. All shifts tracked for it are torn down via
+    _cleanup_shift_keys (draft deleted, published left + notified)."""
+    shifts_state: dict[str, Any] = state["shifts"]
+    keys = [k for k, v in shifts_state.items() if v.get("opportunityId") == opportunity_id]
+    if not keys:
+        return {"status": "skipped", "reason": reason, "tracked_shifts": 0}
+
+    result = _cleanup_shift_keys(client, keys, shifts_state, opportunity_id, reason)
+    return {"status": "cleaned_up", "reason": reason, **result}
 
 
 # ---------------------------------------------------------------------------
@@ -536,8 +588,31 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         return {"status": "skipped", "reason": reason, **cleanup_result}
 
     services = fetch_service_items(client, opportunity_id)
+    shifts_state: dict[str, Any] = state["shifts"]
+
+    # A service line item that's tracked (we made a shift for it before) but
+    # no longer shows up here — deleted from the opportunity, or had its
+    # dates cleared — is torn down the same way a whole ineligible
+    # opportunity is: draft deleted, published left + Chat notification.
+    current_keys = {str(service["id"]) for service in services}
+    orphaned_keys = [
+        k
+        for k, v in shifts_state.items()
+        if v.get("opportunityId") == opportunity_id and k not in current_keys
+    ]
+    orphan_result = (
+        _cleanup_shift_keys(
+            client, orphaned_keys, shifts_state, opportunity_id, "service item removed from opportunity"
+        )
+        if orphaned_keys
+        else None
+    )
+
     if not services:
-        return {"status": "skipped", "reason": "no dated Service line items found"}
+        result: dict[str, Any] = {"status": "skipped", "reason": "no dated Service line items found"}
+        if orphan_result:
+            result["orphaned_items_cleaned_up"] = orphan_result
+        return result
 
     address = fetch_venue_address(client, opportunity)
     order_number = opportunity.get("number")
@@ -546,7 +621,6 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     subject = opportunity.get("subject") or f"Order {opportunity.get('number', opportunity['id'])}"
     if "#" in subject:
         subject = subject.split("#", 1)[1].strip()
-    shifts_state: dict[str, Any] = state["shifts"]
 
     to_create: list[tuple[str, dict[str, Any], dict[str, Any]]] = []  # (key, payload, desired)
     to_update: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
@@ -755,13 +829,33 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         existing.update(desired)
         shifts_state[key] = existing
 
-    return {
+    # A shift someone already published can still be in to_update (nothing
+    # here checks publish state before editing — Current RMS changes are
+    # still pushed through). Ops gets a heads-up so crew who were told about
+    # the original time/details aren't caught out by a silent change.
+    published_edits = 0
+    for (_, _, desired), shift_obj in zip(to_update, updated_shifts):
+        if shift_obj.get("isPublished"):
+            published_edits += 1
+            notify_ops(
+                client,
+                f"✏️ Published Connecteam shift edited by sync.\n"
+                f"Opportunity {opportunity_id} (order {order_number}) — a change in Current RMS was "
+                f"pushed to the already-published shift \"{desired.get('title')}\" ({shift_obj['id']}). "
+                f"Please confirm crew are aware of the change.",
+            )
+
+    result = {
         "status": "ok",
         "created_count": len(created_shifts),
         "updated_count": len(updated_shifts),
         "unchanged_count": unchanged,
         "skipped_count": len(skipped),
+        "published_edits_count": published_edits,
     }
+    if orphan_result:
+        result["orphaned_items_cleaned_up"] = orphan_result
+    return result
 
 
 def poll_all_open_orders() -> dict[str, Any]:
@@ -783,11 +877,25 @@ def poll_all_open_orders() -> dict[str, Any]:
                 try:
                     results[str(opportunity_id)] = sync_opportunity(client, opportunity_id, state)
                 except httpx.HTTPStatusError as exc:
-                    log.exception("Poll failed for opportunity %s", opportunity_id)
-                    results[str(opportunity_id)] = {
-                        "status": "error",
-                        "detail": f"{exc.response.status_code} {exc.response.text[:300]}",
-                    }
+                    if exc.response.status_code == 404:
+                        # Opportunity was deleted and the poll (not the webhook) is
+                        # what found out — clean up the same way the webhook's
+                        # Action_type=="destroy" path does, instead of leaving
+                        # orphaned shifts to 404 again every subsequent poll.
+                        log.warning(
+                            "Opportunity %s 404'd during poll — treating as deleted and cleaning up",
+                            opportunity_id,
+                        )
+                        cleanup_result = cleanup_ineligible_opportunity(
+                            client, opportunity_id, "deleted (404 on poll)", state
+                        )
+                        results[str(opportunity_id)] = {"status": "skipped", "reason": "deleted", **cleanup_result}
+                    else:
+                        log.exception("Poll failed for opportunity %s", opportunity_id)
+                        results[str(opportunity_id)] = {
+                            "status": "error",
+                            "detail": f"{exc.response.status_code} {exc.response.text[:300]}",
+                        }
 
         state["poll_cursor"] = (poll_start - timedelta(minutes=POLL_OVERLAP_MINUTES)).isoformat()
         _save_state(state)
