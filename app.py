@@ -1094,6 +1094,58 @@ async def backfill(token: str | None = None, ids: str | None = None):
     return JSONResponse(result)
 
 
+@app.post("/debug/create-jobs")
+async def debug_create_jobs(titles: str, token: str | None = None):
+    """TEMPORARY, one-off. Creates a Connecteam Job (task type) for each
+    comma-separated title in `titles`, in whichever scheduler
+    CONNECTEAM_SCHEDULER_ID currently points at. Skips any title that
+    already has a matching Job (idempotent-ish safety net) — never
+    duplicates, never renames/deletes an existing Job. Protected by
+    BACKFILL_TOKEN (reused — one-off admin action, not part of normal
+    sync). Remove this route once the service<->Job mapping cleanup is
+    done."""
+    if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    wanted = [t.strip() for t in titles.split(",") if t.strip()]
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
+        with httpx.Client(timeout=30) as client:
+            existing_titles, _ = _load_job_title_cache(client)
+            created: list[str] = []
+            skipped: list[str] = []
+            errors: list[dict[str, Any]] = []
+            for title in wanted:
+                if title in existing_titles:
+                    skipped.append(title)
+                    continue
+                resp = client.post(
+                    f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+                    headers=headers,
+                    json=[
+                        {
+                            "instanceIds": [int(CONNECTEAM_SCHEDULER_ID)],
+                            "title": title,
+                            "assign": {"type": "both", "userIds": [], "groupIds": []},
+                        }
+                    ],
+                )
+                if resp.status_code >= 400:
+                    errors.append({"title": title, "status": resp.status_code, "body": resp.text[:300]})
+                    continue
+                created.append(title)
+        return {
+            "scheduler_id": CONNECTEAM_SCHEDULER_ID,
+            "created": created,
+            "skipped_already_existed": skipped,
+            "errors": errors,
+        }
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
