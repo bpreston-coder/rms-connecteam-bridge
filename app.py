@@ -1181,6 +1181,116 @@ async def debug_create_jobs(titles: str, token: str | None = None):
     return JSONResponse(result)
 
 
+@app.get("/debug/sweep-mismatched-jobs")
+async def debug_sweep_mismatched_jobs(token: str | None = None, apply: bool = False):
+    """TEMPORARY, one-off. Finds every tracked shift whose Connecteam Job no
+    longer matches what SERVICE_JOB_OVERRIDES says it should be — chiefly
+    shifts created before that mapping existed, which got no Job at all, or
+    the wrong one. For each: refetches the opportunity's current service
+    items (shifts_state doesn't store the RMS service name, only the
+    opportunity subject) to recompute the expected jobId, and compares it
+    against the shift's LIVE jobId in Connecteam.
+
+    Dry-run by default (apply=false): reports mismatches, deletes nothing.
+    Pass apply=true to actually delete — ONLY drafts are ever deleted;
+    published shifts are always left in place and reported separately (with
+    a Google Chat notification), never touched. A deleted shift's state
+    entry is also dropped so the next normal sync recreates it fresh with
+    the correct Job. Protected by BACKFILL_TOKEN. Remove this route once
+    the sweep has been run and confirmed."""
+    if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        with sync_lock:
+            state = _load_state()
+            shifts_state: dict[str, Any] = state["shifts"]
+            job_title_cache: dict[str, Any] = state["job_title_cache"]
+            opportunity_ids = sorted({v["opportunityId"] for v in shifts_state.values()})
+
+            mismatches: list[dict[str, Any]] = []
+            deleted: list[dict[str, Any]] = []
+            left_published: list[dict[str, Any]] = []
+            already_gone = 0
+            checked = 0
+
+            with httpx.Client(timeout=30) as client:
+                for opportunity_id in opportunity_ids:
+                    try:
+                        services = fetch_service_items(client, opportunity_id)
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code == 404:
+                            continue  # deleted opportunity — handled by the normal 404 cleanup paths, not this sweep
+                        raise
+                    service_name_by_key = {str(s["id"]): s["name"] for s in services}
+
+                    keys = [k for k, v in shifts_state.items() if v.get("opportunityId") == opportunity_id]
+                    for key in keys:
+                        service_name = service_name_by_key.get(key)
+                        if service_name is None:
+                            continue  # item no longer on the opportunity — the orphan-cleanup path handles this, not this sweep
+                        checked += 1
+
+                        expected_job_id = find_job_by_service_name(client, service_name, job_title_cache)
+                        entry = shifts_state[key]
+                        shift_id = entry["shiftId"]
+                        shift = get_shift(client, shift_id)
+                        if shift is None:
+                            already_gone += 1
+                            del shifts_state[key]
+                            continue
+
+                        actual_job_id = shift.get("jobId")
+                        if actual_job_id == expected_job_id:
+                            continue
+
+                        row = {
+                            "opportunity_id": opportunity_id,
+                            "shift_id": shift_id,
+                            "service_name": service_name,
+                            "shift_title": shift.get("title"),
+                            "actual_job_id": actual_job_id,
+                            "expected_job_id": expected_job_id,
+                            "is_published": bool(shift.get("isPublished")),
+                        }
+                        mismatches.append(row)
+
+                        if shift.get("isPublished"):
+                            left_published.append(row)
+                            if apply:
+                                notify_ops(
+                                    client,
+                                    f"⚠️ Published Connecteam shift has the wrong Job and needs manual "
+                                    f"review.\nOpportunity {opportunity_id} — shift \"{shift.get('title')}\" "
+                                    f"({shift_id}), service \"{service_name}\": Job mismatch found during the "
+                                    f"service-mapping sweep. Left in place (published) — please reassign its "
+                                    f"Job manually in Connecteam.",
+                                )
+                            continue
+
+                        if apply:
+                            delete_shift(client, shift_id)
+                            del shifts_state[key]
+                            deleted.append(row)
+
+            if apply:
+                _save_state(state)
+
+        return {
+            "applied": apply,
+            "opportunities_checked": len(opportunity_ids),
+            "shifts_checked": checked,
+            "mismatches_found": len(mismatches),
+            "mismatches": mismatches,
+            "deleted_draft_count": len(deleted),
+            "left_published_count": len(left_published),
+            "already_gone_count": already_gone,
+        }
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
