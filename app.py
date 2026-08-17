@@ -1185,6 +1185,49 @@ async def debug_list_shifts(
     return JSONResponse(result)
 
 
+@app.delete("/debug/shifts")
+async def debug_delete_shifts(ids: str, token: str | None = None):
+    """TEMPORARY, one-off. ids = comma-separated Connecteam shift IDs to
+    permanently delete. Refuses to delete any shift that's currently
+    published (fetches each one first to check) — this is for clearing out
+    confirmed-orphan drafts found via /debug/list-shifts, never for
+    touching a shift a human has already published. Protected by
+    BACKFILL_TOKEN. Remove this route once the investigation is done."""
+    if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+    id_list = [i.strip() for i in ids.split(",") if i.strip()]
+
+    def _run() -> dict[str, Any]:
+        deleted: list[str] = []
+        refused_published: list[str] = []
+        already_gone: list[str] = []
+        errors: list[dict[str, Any]] = []
+        with httpx.Client(timeout=30) as client:
+            for sid in id_list:
+                shift = get_shift(client, sid)
+                if shift is None:
+                    already_gone.append(sid)
+                    continue
+                if shift.get("isPublished"):
+                    refused_published.append(sid)
+                    continue
+                try:
+                    delete_shift(client, sid)
+                    deleted.append(sid)
+                except httpx.HTTPStatusError as exc:
+                    errors.append({"id": sid, "status": exc.response.status_code, "body": exc.response.text[:300]})
+        return {
+            "deleted_count": len(deleted),
+            "deleted": deleted,
+            "refused_published": refused_published,
+            "already_gone": already_gone,
+            "errors": errors,
+        }
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
