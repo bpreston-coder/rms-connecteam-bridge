@@ -1182,7 +1182,7 @@ async def debug_create_jobs(titles: str, token: str | None = None):
 
 
 @app.get("/debug/sweep-mismatched-jobs")
-async def debug_sweep_mismatched_jobs(token: str | None = None, apply: bool = False):
+async def debug_sweep_mismatched_jobs(token: str | None = None, apply: bool = False, notify: bool = True):
     """TEMPORARY, one-off. Finds every tracked shift whose Connecteam Job no
     longer matches what SERVICE_JOB_OVERRIDES says it should be — chiefly
     shifts created before that mapping existed, which got no Job at all, or
@@ -1193,11 +1193,15 @@ async def debug_sweep_mismatched_jobs(token: str | None = None, apply: bool = Fa
 
     Dry-run by default (apply=false): reports mismatches, deletes nothing.
     Pass apply=true to actually delete — ONLY drafts are ever deleted;
-    published shifts are always left in place and reported separately (with
-    a Google Chat notification), never touched. A deleted shift's state
-    entry is also dropped so the next normal sync recreates it fresh with
-    the correct Job. Protected by BACKFILL_TOKEN. Remove this route once
-    the sweep has been run and confirmed."""
+    published shifts are always left in place and reported separately,
+    never touched. A deleted shift's state entry is also dropped so the
+    next normal sync recreates it fresh with the correct Job. Pass
+    notify=false alongside apply=true to suppress the per-published-shift
+    Google Chat notification for this run (e.g. a large one-time historical
+    backlog where the mismatches are already known, not a fresh incident) —
+    defaults to true (normal per-shift notification) otherwise. Protected
+    by BACKFILL_TOKEN. Remove this route once the sweep has been run and
+    confirmed."""
     if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
         raise HTTPException(status_code=403, detail="invalid or missing token")
 
@@ -1275,7 +1279,7 @@ async def debug_sweep_mismatched_jobs(token: str | None = None, apply: bool = Fa
 
                         if shift.get("isPublished"):
                             left_published.append(row)
-                            if apply:
+                            if apply and notify:
                                 notify_ops(
                                     client,
                                     f"⚠️ Published Connecteam shift has the wrong Job and needs manual "
