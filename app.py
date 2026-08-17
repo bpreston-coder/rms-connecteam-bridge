@@ -1201,6 +1201,23 @@ async def debug_sweep_mismatched_jobs(token: str | None = None, apply: bool = Fa
     if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
         raise HTTPException(status_code=403, detail="invalid or missing token")
 
+    def _with_backoff(fn, *args, max_retries: int = 6, **kwargs):
+        """Retry on 429 with the server's Retry-After (or exponential
+        backoff if absent) — this sweep hits get_shift/delete_shift once per
+        tracked shift in a tight loop, which is enough volume to trip
+        Connecteam's rate limit on its own (confirmed live: a bare run hit
+        a 429 and crashed the request with an unhandled 500)."""
+        for attempt in range(max_retries):
+            try:
+                return fn(*args, **kwargs)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429 and attempt < max_retries - 1:
+                    delay = float(exc.response.headers.get("Retry-After", 2 * (attempt + 1)))
+                    log.warning("Rate limited, backing off %.1fs (attempt %d)", delay, attempt + 1)
+                    time.sleep(delay)
+                    continue
+                raise
+
     def _run() -> dict[str, Any]:
         with sync_lock:
             state = _load_state()
@@ -1230,11 +1247,12 @@ async def debug_sweep_mismatched_jobs(token: str | None = None, apply: bool = Fa
                         if service_name is None:
                             continue  # item no longer on the opportunity — the orphan-cleanup path handles this, not this sweep
                         checked += 1
+                        time.sleep(0.15)  # stay well under Connecteam's rate limit across a large sweep
 
                         expected_job_id = find_job_by_service_name(client, service_name, job_title_cache)
                         entry = shifts_state[key]
                         shift_id = entry["shiftId"]
-                        shift = get_shift(client, shift_id)
+                        shift = _with_backoff(get_shift, client, shift_id)
                         if shift is None:
                             already_gone += 1
                             del shifts_state[key]
@@ -1269,7 +1287,7 @@ async def debug_sweep_mismatched_jobs(token: str | None = None, apply: bool = Fa
                             continue
 
                         if apply:
-                            delete_shift(client, shift_id)
+                            _with_backoff(delete_shift, client, shift_id)
                             del shifts_state[key]
                             deleted.append(row)
 
