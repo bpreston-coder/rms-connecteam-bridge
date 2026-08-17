@@ -316,6 +316,10 @@ def _to_epoch_seconds(iso_ts: str) -> int:
     return int(dt.astimezone(timezone.utc).timestamp())
 
 
+def _format_epoch(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%a %d %b %Y, %H:%M UTC")
+
+
 def _load_job_title_cache(client: httpx.Client) -> tuple[dict[str, str], dict[str, str]]:
     """Fetch every Job in this scheduler and index by exact title, and
     separately by jobId -> color (so shift payloads can inherit the Job's
@@ -824,6 +828,10 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             _rebuild_job_fields(payload, desired, key)
         updated_shifts = update_shifts(client, [p for _, p, _ in to_update])
 
+    # Snapshot pre-update state before it's overwritten below, so the
+    # published-edit notification can describe exactly what changed.
+    previous_by_key = {key: dict(shifts_state.get(key, {})) for key, _, _ in to_update}
+
     for key, _, desired in to_update:
         existing = shifts_state.get(key, {})
         existing.update(desired)
@@ -831,17 +839,36 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
 
     # A shift someone already published can still be in to_update (nothing
     # here checks publish state before editing — Current RMS changes are
-    # still pushed through). Ops gets a heads-up so crew who were told about
-    # the original time/details aren't caught out by a silent change.
+    # still pushed through). Ops gets a heads-up, with specifics, so crew
+    # who were told about the original time/details aren't caught out by a
+    # silent change.
     published_edits = 0
-    for (_, _, desired), shift_obj in zip(to_update, updated_shifts):
+    for (key, _, desired), shift_obj in zip(to_update, updated_shifts):
         if shift_obj.get("isPublished"):
             published_edits += 1
+            previous = previous_by_key.get(key, {})
+            changes: list[str] = []
+            if previous.get("startTime") != desired.get("startTime") or previous.get("endTime") != desired.get(
+                "endTime"
+            ):
+                changes.append(
+                    f"Time: {_format_epoch(previous['startTime'])} – {_format_epoch(previous['endTime'])} "
+                    f"→ {_format_epoch(desired['startTime'])} – {_format_epoch(desired['endTime'])}"
+                )
+            if previous.get("title") != desired.get("title"):
+                changes.append(f'Title: "{previous.get("title")}" → "{desired.get("title")}"')
+            if previous.get("quantity") != desired.get("quantity"):
+                changes.append(f"Quantity required: {previous.get('quantity')} → {desired.get('quantity')}")
+            if previous.get("address") != desired.get("address"):
+                changes.append(f"Address: {previous.get('address')} → {desired.get('address')}")
+            if previous.get("description") != desired.get("description"):
+                changes.append(f'Notes: "{previous.get("description")}" → "{desired.get("description")}"')
+            change_text = "\n".join(f"  • {c}" for c in changes) if changes else "  (no tracked-field change detected)"
             notify_ops(
                 client,
                 f"✏️ Published Connecteam shift edited by sync.\n"
-                f"Opportunity {opportunity_id} (order {order_number}) — a change in Current RMS was "
-                f"pushed to the already-published shift \"{desired.get('title')}\" ({shift_obj['id']}). "
+                f"Opportunity {opportunity_id} (order {order_number}) — shift \"{desired.get('title')}\" "
+                f"({shift_obj['id']}):\n{change_text}\n"
                 f"Please confirm crew are aware of the change.",
             )
 
