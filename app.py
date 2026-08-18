@@ -200,6 +200,14 @@ MAX_SHIFT_SPAN_DAYS = 14
 # returning it.
 EXCLUDED_SERVICE_NAMES = {"Per diem", "Accomodation - Per night"}
 
+# A Service line item's status_name once someone finalises/completes it in
+# Current RMS (after which Current RMS itself won't let it be edited
+# further). Once finalised, the bridge leaves its shift completely alone —
+# no create, no update, no delete, no notification — see
+# _expand_service_segments' protected_keys handling. Confirmed with the
+# user 2026-08-18.
+FINALISED_STATUS_NAME = "Completed"
+
 # Background poll: catches Service-item edits made *after* conversion (no
 # Current RMS webhook fires for those). Runs every POLL_INTERVAL_SECONDS.
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", 15 * 60))
@@ -712,7 +720,7 @@ def cleanup_ineligible_opportunity(
 
 def _expand_service_segments(
     services: list[dict[str, Any]],
-) -> tuple[list[tuple[str, dict[str, Any], int, int]], list[tuple[str, str]]]:
+) -> tuple[list[tuple[str, dict[str, Any], int, int]], list[tuple[str, str]], set[str]]:
     """Turn each dated Service line item into one or more (key, service,
     start, end) rows — one per Australia/Perth calendar day it spans (see
     _split_into_daily_segments). A same-day item keeps its plain
@@ -722,12 +730,23 @@ def _expand_service_segments(
     "{id}:{day_index}" keys instead. A "Day Rate" service (Current RMS
     service_rate_type_name == "Day") gets full 00:00->24:00 Perth segments
     regardless of its literal starts_at/ends_at time-of-day — see
-    _split_into_daily_segments' full_day parameter for why. Returns
-    (expanded, skipped) — skipped covers items that can't be scheduled at
-    all (bad times, or a span longer than MAX_SHIFT_SPAN_DAYS calendar
-    days)."""
+    _split_into_daily_segments' full_day parameter for why.
+
+    A FINALISED_STATUS_NAME service (Current RMS status_name == "Completed"
+    — set once someone finalises/completes it, after which Current RMS
+    itself won't let it be edited further) is deliberately left OUT of
+    `expanded`, so nothing about its shift is ever created/updated. Its
+    key(s) still go into `protected_keys` though, so the caller's orphan
+    detection treats it as still present rather than removed — the whole
+    point is that nothing happens to it either way, not that its existing
+    shift gets torn down. Confirmed with the user 2026-08-18.
+
+    Returns (expanded, skipped, protected_keys) — skipped covers items that
+    can't be scheduled at all (bad times, or a span longer than
+    MAX_SHIFT_SPAN_DAYS calendar days)."""
     expanded: list[tuple[str, dict[str, Any], int, int]] = []
     skipped: list[tuple[str, str]] = []
+    protected_keys: set[str] = set()
     for service in services:
         start = _to_epoch_seconds(service["starts_at"])
         end = _to_epoch_seconds(service["ends_at"])
@@ -741,11 +760,15 @@ def _expand_service_segments(
             skipped.append((service["name"], f"span exceeds {MAX_SHIFT_SPAN_DAYS}-day split cap"))
             continue
 
+        finalised = service.get("status_name") == FINALISED_STATUS_NAME
         single_day = len(segments) == 1
         for day_index, (seg_start, seg_end) in enumerate(segments):
             key = str(service["id"]) if single_day else f"{service['id']}:{day_index}"
+            if finalised:
+                protected_keys.add(key)
+                continue
             expanded.append((key, service, seg_start, seg_end))
-    return expanded, skipped
+    return expanded, skipped, protected_keys
 
 
 def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str, Any]) -> dict[str, Any]:
@@ -769,12 +792,13 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     # dates cleared — is torn down the same way a whole ineligible
     # opportunity is: deleted outright (draft or published), Chat notified
     # if it was published. Same applies to a single-day-turned-multi-day (or
-    # vice versa) item's
-    # now-stale key, since _expand_service_segments changes key format
-    # between the two cases — current_keys covers every key that SHOULD
-    # exist right now, split or not.
-    expanded_segments, segment_skips = _expand_service_segments(services)
-    current_keys = {key for key, _, _, _ in expanded_segments}
+    # vice versa) item's now-stale key, since _expand_service_segments
+    # changes key format between the two cases — current_keys covers every
+    # key that SHOULD exist right now (split or not) PLUS every finalised
+    # item's key, so a finalised item's shift is protected from this
+    # teardown rather than treated as removed (see protected_keys).
+    expanded_segments, segment_skips, protected_keys = _expand_service_segments(services)
+    current_keys = {key for key, _, _, _ in expanded_segments} | protected_keys
     orphaned_keys = [
         k
         for k, v in shifts_state.items()
@@ -1205,7 +1229,7 @@ async def debug_inspect_sync(opportunity_id: int, token: str | None = None):
         shifts_state: dict[str, Any] = state["shifts"]
         with httpx.Client(timeout=30) as client:
             services = fetch_service_items(client, opportunity_id)
-            expanded_segments, _ = _expand_service_segments(services)
+            expanded_segments, _, _ = _expand_service_segments(services)
             rows = []
             for key, service, seg_start, seg_end in expanded_segments:
                 existing = shifts_state.get(key)
