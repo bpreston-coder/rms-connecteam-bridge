@@ -22,24 +22,29 @@ Current RMS opportunity_item's ID:
     nothing.
   - If the opportunity is no longer eligible (flag unticked, went dead/
     lost/reverted, or was deleted outright — including a deletion the poll
-    discovers as a 404, not just one caught by webhook) -> DELETE any
-    shifts we created that are still draft; leave already-published shifts
-    alone for manual review.
+    discovers as a 404, not just one caught by webhook) -> DELETE every
+    shift we created for it, draft or already-published alike — the
+    underlying work is genuinely gone, so it's no longer real work someone
+    needs to show up for.
   - Same teardown applies at the individual item level: if one service line
     item is removed from an opportunity that's still otherwise eligible,
-    only that item's shift is cleaned up (draft deleted / published left).
+    only that item's shift is deleted (again, draft or published).
   - A Service line item spanning more than one Australia/Perth calendar day
     becomes one shift PER calendar day it touches (see
     _split_into_daily_segments), each independently created/updated/deleted
     by opportunity_item-id + day-index. Beyond MAX_SHIFT_SPAN_DAYS calendar
     days it's skipped instead, the same as an unschedulable time range.
-  - Whenever a published shift is left in place instead of deleted, or gets
-    edited in place because Current RMS changed under it, ops is notified
-    in Google Chat (see notify_ops / GOOGLE_CHAT_WEBHOOK_URL) so a human
-    knows to check on a shift crew may already have been told about.
+  - Whenever a published shift is deleted, or gets edited in place because
+    Current RMS changed under it, ops is notified in Google Chat (see
+    notify_ops / GOOGLE_CHAT_WEBHOOK_URL) so a human knows a shift crew may
+    already have been told about was just removed or changed — after the
+    fact, since by the time the message lands the action has already
+    happened (deliberate as of 2026-08-18; earlier versions of this bridge
+    left a published shift in place for manual review instead of deleting
+    it outright).
 This guarantees we never create duplicate shifts, no matter how many times
 an opportunity is processed (webhook retries, overlapping polls, re-
-conversions), and never silently blow away a shift someone has published.
+conversions).
 
 It also finds a Connecteam Job per Service line item (matched by service
 name, never created here), writes the Current RMS order number into the
@@ -160,11 +165,10 @@ WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 BACKFILL_TOKEN = os.environ.get("BACKFILL_TOKEN", "")
 
 # Incoming webhook URL for the ops Google Chat space. Posted to whenever a
-# shift a human already published gets left in place during cleanup (would
-# otherwise have been deleted) or gets edited by the sync — both cases where
-# a real person may have already told crew about that shift. Unset by
-# default: notify_ops() just logs and no-ops rather than failing sync, so
-# this is safe to leave unconfigured in test.
+# shift a human already published gets deleted during cleanup or edited by
+# the sync — both cases where a real person may have already told crew about
+# that shift. Unset by default: notify_ops() just logs and no-ops rather
+# than failing sync, so this is safe to leave unconfigured in test.
 GOOGLE_CHAT_WEBHOOK_URL = os.environ.get("GOOGLE_CHAT_WEBHOOK_URL", "")
 
 # Where we remember: (a) which Connecteam shift belongs to which Current RMS
@@ -638,17 +642,20 @@ def _cleanup_shift_keys(
 ) -> dict[str, Any]:
     """Shared teardown for a set of tracked shift keys that should no longer
     exist (whole opportunity ineligible, or an individual service item gone
-    from an opportunity that's otherwise still eligible). Draft shifts are
-    deleted outright. A shift a human already published is left in place —
-    real scheduling work has gone into it — but ops gets a Google Chat ping
-    since without this bridge would have deleted it. All keys passed in
-    belong to one opportunity (every caller scopes it that way), so any
-    published-left-in-place pings are batched into ONE Chat message rather
-    than one per shift — same reasoning as the published-edit notification
-    in sync_opportunity (confirmed with the user 2026-08-18)."""
+    from an opportunity that's otherwise still eligible) — deleted outright
+    from Connecteam, draft or already-published alike. Ops is notified
+    afterwards rather than being asked to act, since the deletion has
+    already happened by the time the message lands (confirmed with the
+    user 2026-08-18 — a deliberate reversal of the earlier "never touch a
+    published shift" safety net: a shift whose underlying Current RMS item
+    is genuinely gone is no longer real work someone needs to show up for).
+    All keys passed in belong to one opportunity (every caller scopes it
+    that way), so the published-deletion notification is batched into ONE
+    Chat message rather than one per shift, same as the published-edit
+    notification in sync_opportunity."""
     deleted = 0
     already_gone = 0
-    left_published_blocks: list[str] = []
+    deleted_published_blocks: list[str] = []
     order_number = None
     for key in keys:
         shift_id = shifts_state[key]["shiftId"]
@@ -658,34 +665,26 @@ def _cleanup_shift_keys(
             del shifts_state[key]
             continue
         if shift.get("isPublished"):
-            log.warning(
-                "Opportunity %s, shift %s should be removed (%s) but is already published — "
-                "leaving it in place for manual review.",
-                opportunity_id, shift_id, reason,
-            )
             order_number = shifts_state[key].get("orderNumber") or order_number
             title = shifts_state[key].get("title")
-            left_published_blocks.append(f'Shift "{title}" ({shift_id})')
-            continue
+            deleted_published_blocks.append(f'"{title}" ({shift_id})')
         delete_shift(client, shift_id)
         deleted += 1
         del shifts_state[key]
 
-    if left_published_blocks:
-        shift_word = "shift" if len(left_published_blocks) == 1 else "shifts"
+    if deleted_published_blocks:
+        shift_word = "shift has" if len(deleted_published_blocks) == 1 else "shifts have"
         notify_ops(
             client,
-            f"⚠️ {len(left_published_blocks)} published Connecteam {shift_word} need manual review.\n"
+            f"🗑️ Published Connecteam {shift_word} been deleted — no longer required.\n"
             f"Opportunity {opportunity_id} (order {order_number}) — {reason}.\n"
-            + "\n".join(left_published_blocks)
-            + "\nAlready published, so the bridge left them in place instead of deleting. "
-            "Please review/cancel in Connecteam.",
+            + "\n".join(deleted_published_blocks),
         )
 
     return {
         "tracked_shifts": len(keys),
-        "deleted_draft_count": deleted,
-        "left_published_count": len(left_published_blocks),
+        "deleted_count": deleted,
+        "deleted_published_count": len(deleted_published_blocks),
         "already_gone_count": already_gone,
     }
 
@@ -696,7 +695,8 @@ def cleanup_ineligible_opportunity(
     """An opportunity that used to be eligible (Order, or flagged Quotation)
     no longer is — flag was unticked, it went dead/lost/reverted, or it was
     deleted outright. All shifts tracked for it are torn down via
-    _cleanup_shift_keys (draft deleted, published left + notified)."""
+    _cleanup_shift_keys (deleted outright, draft or published; ops notified
+    afterwards for anything that was published)."""
     shifts_state: dict[str, Any] = state["shifts"]
     keys = [k for k, v in shifts_state.items() if v.get("opportunityId") == opportunity_id]
     if not keys:
@@ -767,8 +767,9 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     # A service line item that's tracked (we made a shift for it before) but
     # no longer shows up here — deleted from the opportunity, or had its
     # dates cleared — is torn down the same way a whole ineligible
-    # opportunity is: draft deleted, published left + Chat notification.
-    # Same applies to a single-day-turned-multi-day (or vice versa) item's
+    # opportunity is: deleted outright (draft or published), Chat notified
+    # if it was published. Same applies to a single-day-turned-multi-day (or
+    # vice versa) item's
     # now-stale key, since _expand_service_segments changes key format
     # between the two cases — current_keys covers every key that SHOULD
     # exist right now, split or not.
