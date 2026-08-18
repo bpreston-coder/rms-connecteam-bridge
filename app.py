@@ -1203,6 +1203,62 @@ async def backfill(token: str | None = None, ids: str | None = None):
     return JSONResponse(result)
 
 
+@app.post("/debug/test-allday")
+async def debug_test_allday(token: str | None = None):
+    """TEMPORARY, one-off. Creates a single throwaway DRAFT shift with
+    allDay=true (undocumented on the create-shift request body, but present
+    on the shift object itself per Connecteam's webhook payload docs) to
+    empirically confirm: (a) is it accepted at all on create, (b) does it
+    survive a read-back, (c) what happens to startTime/endTime when set.
+    Deletes the test shift before returning. Protected by BACKFILL_TOKEN.
+    Remove this route once the allDay behavior is confirmed."""
+    if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
+        now = int(time.time())
+        day_start = (now // 86400) * 86400
+        day_end = day_start + 86400
+        payload = {
+            "startTime": day_start,
+            "endTime": day_end,
+            "title": "CLAUDE allDay TEST — safe to ignore/delete",
+            "isPublished": False,
+            "allDay": True,
+        }
+        with httpx.Client(timeout=30) as client:
+            create_resp = client.post(
+                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+                headers=headers,
+                json=[payload],
+                params={"notifyUsers": "false"},
+            )
+            result: dict[str, Any] = {
+                "create_status": create_resp.status_code,
+                "create_body": create_resp.text[:2000],
+            }
+            if create_resp.status_code >= 400:
+                return result
+
+            created = create_resp.json().get("data", {}).get("shifts", [])
+            if not created:
+                result["error"] = "no shift in create response"
+                return result
+            shift_id = created[0]["id"]
+            result["created_shift_raw"] = created[0]
+
+            readback = get_shift(client, shift_id)
+            result["readback"] = readback
+
+            delete_shift(client, shift_id)
+            result["deleted"] = True
+        return result
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
