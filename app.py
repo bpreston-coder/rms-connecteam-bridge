@@ -185,6 +185,17 @@ MAX_SHIFT_SECONDS = 24 * 60 * 60  # Connecteam: a shift can't exceed 24h.
 PERTH_TZ = timezone(timedelta(hours=8))
 MAX_SHIFT_SPAN_DAYS = 14
 
+# These Service line items are cost/allowance entries, not an actual crew
+# shift someone needs to turn up for — never synced to Connecteam. Matched
+# on the Current RMS service["name"] exactly. Confirmed with the user
+# 2026-08-18. An opportunity with only excluded services still gets its
+# other (non-excluded) items synced normally; if one of these was already
+# tracked from before this exclusion existed, it's cleaned up the same way
+# any other item removed from the opportunity would be (see the orphan
+# teardown in sync_opportunity), since fetch_service_items simply stops
+# returning it.
+EXCLUDED_SERVICE_NAMES = {"Per diem", "Accomodation - Per night"}
+
 # Background poll: catches Service-item edits made *after* conversion (no
 # Current RMS webhook fires for those). Runs every POLL_INTERVAL_SECONDS.
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", 15 * 60))
@@ -350,7 +361,10 @@ def fetch_service_items(client: httpx.Client, opportunity_id: int) -> list[dict[
     return [
         item
         for item in items
-        if item.get("item_type") == "Service" and item.get("starts_at") and item.get("ends_at")
+        if item.get("item_type") == "Service"
+        and item.get("starts_at")
+        and item.get("ends_at")
+        and item.get("name") not in EXCLUDED_SERVICE_NAMES
     ]
 
 
@@ -611,10 +625,15 @@ def _cleanup_shift_keys(
     from an opportunity that's otherwise still eligible). Draft shifts are
     deleted outright. A shift a human already published is left in place —
     real scheduling work has gone into it — but ops gets a Google Chat ping
-    since without this bridge would have deleted it."""
+    since without this bridge would have deleted it. All keys passed in
+    belong to one opportunity (every caller scopes it that way), so any
+    published-left-in-place pings are batched into ONE Chat message rather
+    than one per shift — same reasoning as the published-edit notification
+    in sync_opportunity (confirmed with the user 2026-08-18)."""
     deleted = 0
-    left_published = 0
     already_gone = 0
+    left_published_blocks: list[str] = []
+    order_number = None
     for key in keys:
         shift_id = shifts_state[key]["shiftId"]
         shift = get_shift(client, shift_id)
@@ -623,30 +642,34 @@ def _cleanup_shift_keys(
             del shifts_state[key]
             continue
         if shift.get("isPublished"):
-            left_published += 1
             log.warning(
                 "Opportunity %s, shift %s should be removed (%s) but is already published — "
                 "leaving it in place for manual review.",
                 opportunity_id, shift_id, reason,
             )
-            order_number = shifts_state[key].get("orderNumber")
+            order_number = shifts_state[key].get("orderNumber") or order_number
             title = shifts_state[key].get("title")
-            notify_ops(
-                client,
-                f"⚠️ Published Connecteam shift needs manual review.\n"
-                f"Opportunity {opportunity_id} (order {order_number}) — {reason}.\n"
-                f"Shift \"{title}\" ({shift_id}) is already published, so the bridge left it in place "
-                f"instead of deleting it. Please review/cancel it in Connecteam.",
-            )
+            left_published_blocks.append(f'Shift "{title}" ({shift_id})')
             continue
         delete_shift(client, shift_id)
         deleted += 1
         del shifts_state[key]
 
+    if left_published_blocks:
+        shift_word = "shift" if len(left_published_blocks) == 1 else "shifts"
+        notify_ops(
+            client,
+            f"⚠️ {len(left_published_blocks)} published Connecteam {shift_word} need manual review.\n"
+            f"Opportunity {opportunity_id} (order {order_number}) — {reason}.\n"
+            + "\n".join(left_published_blocks)
+            + "\nAlready published, so the bridge left them in place instead of deleting. "
+            "Please review/cancel in Connecteam.",
+        )
+
     return {
         "tracked_shifts": len(keys),
         "deleted_draft_count": deleted,
-        "left_published_count": left_published,
+        "left_published_count": len(left_published_blocks),
         "already_gone_count": already_gone,
     }
 
@@ -967,11 +990,15 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     # here checks publish state before editing — Current RMS changes are
     # still pushed through). Ops gets a heads-up, with specifics, so crew
     # who were told about the original time/details aren't caught out by a
-    # silent change.
-    published_edits = 0
+    # silent change. Batched into ONE Chat message for this whole sync call
+    # rather than one per shift — a single RMS edit (e.g. renaming the
+    # order) can touch every shift on the opportunity at once, and a wall of
+    # near-identical pings for what's really one underlying change is just
+    # noise (confirmed with the user 2026-08-18 after exactly that: a title
+    # rename fanned out to 2 separate notifications for 2 shifts).
+    published_edit_blocks: list[str] = []
     for (key, _, desired), shift_obj in zip(to_update, updated_shifts):
         if shift_obj.get("isPublished"):
-            published_edits += 1
             previous = previous_by_key.get(key, {})
             changes: list[str] = []
             if previous.get("startTime") != desired.get("startTime") or previous.get("endTime") != desired.get(
@@ -990,13 +1017,20 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             if previous.get("description") != desired.get("description"):
                 changes.append(f'Notes: "{previous.get("description")}" → "{desired.get("description")}"')
             change_text = "\n".join(f"  • {c}" for c in changes) if changes else "  (no tracked-field change detected)"
-            notify_ops(
-                client,
-                f"✏️ Published Connecteam shift edited by sync.\n"
-                f"Opportunity {opportunity_id} (order {order_number}) — shift \"{desired.get('title')}\" "
-                f"({shift_obj['id']}):\n{change_text}\n"
-                f"Please confirm crew are aware of the change.",
+            published_edit_blocks.append(
+                f"Shift \"{desired.get('title')}\" ({shift_obj['id']}):\n{change_text}"
             )
+
+    published_edits = len(published_edit_blocks)
+    if published_edit_blocks:
+        shift_word = "shift" if published_edits == 1 else "shifts"
+        notify_ops(
+            client,
+            f"✏️ {published_edits} published Connecteam {shift_word} edited by sync.\n"
+            f"Opportunity {opportunity_id} (order {order_number}):\n\n"
+            + "\n\n".join(published_edit_blocks)
+            + "\n\nPlease confirm crew are aware of the change.",
+        )
 
     result = {
         "status": "ok",
@@ -1220,62 +1254,6 @@ async def backfill(token: str | None = None, ids: str | None = None):
 
     result = await asyncio.to_thread(_run)
     log.info("Backfill checked %d opportunit(y/ies)", result["checked"])
-    return JSONResponse(result)
-
-
-@app.post("/debug/test-allday")
-async def debug_test_allday(token: str | None = None):
-    """TEMPORARY, one-off. Creates a single throwaway DRAFT shift with
-    allDay=true (undocumented on the create-shift request body, but present
-    on the shift object itself per Connecteam's webhook payload docs) to
-    empirically confirm: (a) is it accepted at all on create, (b) does it
-    survive a read-back, (c) what happens to startTime/endTime when set.
-    Deletes the test shift before returning. Protected by BACKFILL_TOKEN.
-    Remove this route once the allDay behavior is confirmed."""
-    if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
-        raise HTTPException(status_code=403, detail="invalid or missing token")
-
-    def _run() -> dict[str, Any]:
-        headers = {"X-API-KEY": CONNECTEAM_API_KEY, "Content-Type": "application/json"}
-        now = int(time.time())
-        day_start = (now // 86400) * 86400
-        day_end = day_start + 86400
-        payload = {
-            "startTime": day_start,
-            "endTime": day_end,
-            "title": "CLAUDE allDay TEST — safe to ignore/delete",
-            "isPublished": False,
-            "allDay": True,
-        }
-        with httpx.Client(timeout=30) as client:
-            create_resp = client.post(
-                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
-                headers=headers,
-                json=[payload],
-                params={"notifyUsers": "false"},
-            )
-            result: dict[str, Any] = {
-                "create_status": create_resp.status_code,
-                "create_body": create_resp.text[:2000],
-            }
-            if create_resp.status_code >= 400:
-                return result
-
-            created = create_resp.json().get("data", {}).get("shifts", [])
-            if not created:
-                result["error"] = "no shift in create response"
-                return result
-            shift_id = created[0]["id"]
-            result["created_shift_raw"] = created[0]
-
-            readback = get_shift(client, shift_id)
-            result["readback"] = readback
-
-            delete_shift(client, shift_id)
-            result["deleted"] = True
-        return result
-
-    result = await asyncio.to_thread(_run)
     return JSONResponse(result)
 
 
