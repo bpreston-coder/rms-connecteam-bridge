@@ -367,14 +367,25 @@ def _format_epoch(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%a %d %b %Y, %H:%M UTC")
 
 
-def _split_into_daily_segments(start: int, end: int) -> list[tuple[int, int]] | None:
+def _split_into_daily_segments(
+    start: int, end: int, full_day: bool = False
+) -> list[tuple[int, int]] | None:
     """Split [start, end) (unix epoch seconds, end already confirmed > start
     by the caller) into one segment per Australia/Perth calendar day it
     touches — e.g. Fri 22:00 -> Sun 06:00 AWST becomes [Fri 22:00->midnight,
     Sat 00:00->24:00, Sun 00:00->06:00]. A same-day span returns a single
     segment identical to the input. Returns None if the span covers more
     than MAX_SHIFT_SPAN_DAYS calendar days — caller should skip instead of
-    splitting into that many shifts."""
+    splitting into that many shifts.
+
+    full_day=True (Current RMS "Day Rate" services) makes every returned
+    segment the FULL Perth calendar day (00:00->24:00), ignoring the actual
+    time-of-day in start/end — this is how a day-rate service is
+    represented on the Connecteam side, since Connecteam's own "all day"
+    shift flag is accepted by its public API but silently has no effect
+    (confirmed 2026-08-18 via direct testing: create + read-back showed no
+    trace of the field at all, same failure mode as the documented
+    isOpenShift/numOfUsers multi-slot limitation)."""
     start_dt = datetime.fromtimestamp(start, tz=PERTH_TZ)
     end_dt = datetime.fromtimestamp(end, tz=PERTH_TZ)
     start_day = start_dt.date()
@@ -386,11 +397,15 @@ def _split_into_daily_segments(start: int, end: int) -> list[tuple[int, int]] | 
     cursor = start
     day = start_day
     while day <= end_day:
-        next_midnight = datetime(day.year, day.month, day.day, tzinfo=PERTH_TZ) + timedelta(days=1)
-        day_end = min(end, int(next_midnight.timestamp()))
-        if day_end > cursor:
-            segments.append((cursor, day_end))
-        cursor = day_end
+        day_start = datetime(day.year, day.month, day.day, tzinfo=PERTH_TZ)
+        next_midnight = day_start + timedelta(days=1)
+        if full_day:
+            segments.append((int(day_start.timestamp()), int(next_midnight.timestamp())))
+        else:
+            day_end = min(end, int(next_midnight.timestamp()))
+            if day_end > cursor:
+                segments.append((cursor, day_end))
+            cursor = day_end
         day += timedelta(days=1)
     return segments
 
@@ -665,9 +680,13 @@ def _expand_service_segments(
     str(service["id"]) key, unchanged from before day-splitting existed, so
     already-tracked single-day shifts are never mistaken for orphans or
     recreated under a new key; a multi-day item's per-day rows get
-    "{id}:{day_index}" keys instead. Returns (expanded, skipped) — skipped
-    covers items that can't be scheduled at all (bad times, or a span
-    longer than MAX_SHIFT_SPAN_DAYS calendar days)."""
+    "{id}:{day_index}" keys instead. A "Day Rate" service (Current RMS
+    service_rate_type_name == "Day") gets full 00:00->24:00 Perth segments
+    regardless of its literal starts_at/ends_at time-of-day — see
+    _split_into_daily_segments' full_day parameter for why. Returns
+    (expanded, skipped) — skipped covers items that can't be scheduled at
+    all (bad times, or a span longer than MAX_SHIFT_SPAN_DAYS calendar
+    days)."""
     expanded: list[tuple[str, dict[str, Any], int, int]] = []
     skipped: list[tuple[str, str]] = []
     for service in services:
@@ -677,7 +696,8 @@ def _expand_service_segments(
             skipped.append((service["name"], "end time is not after start time"))
             continue
 
-        segments = _split_into_daily_segments(start, end)
+        full_day = service.get("service_rate_type_name") == "Day"
+        segments = _split_into_daily_segments(start, end, full_day=full_day)
         if segments is None:
             skipped.append((service["name"], f"span exceeds {MAX_SHIFT_SPAN_DAYS}-day split cap"))
             continue
