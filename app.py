@@ -384,25 +384,41 @@ def _format_epoch(ts: int) -> str:
 def _split_into_daily_segments(
     start: int, end: int, full_day: bool = False
 ) -> list[tuple[int, int]] | None:
-    """Split [start, end) (unix epoch seconds, end already confirmed > start
-    by the caller) into one segment per Australia/Perth calendar day it
-    touches — e.g. Fri 22:00 -> Sun 06:00 AWST becomes [Fri 22:00->midnight,
-    Sat 00:00->24:00, Sun 00:00->06:00]. A same-day span returns a single
-    segment identical to the input. Returns None if the span covers more
-    than MAX_SHIFT_SPAN_DAYS calendar days — caller should skip instead of
-    splitting into that many shifts.
+    """Return the Connecteam shift segment(s) for [start, end) (unix epoch
+    seconds, end already confirmed > start by the caller).
+
+    Connecteam's actual constraint is a 24-HOUR DURATION limit, not a
+    calendar-day one — a single shift is free to cross midnight (e.g. 8pm
+    -> 2am, 6h) so that stays exactly ONE segment with its literal times,
+    not two pieces cut at the midnight boundary. Only once the span
+    genuinely exceeds MAX_SHIFT_SECONDS does it get split into one segment
+    per Australia/Perth calendar day it touches — e.g. Fri 22:00 -> Sun
+    06:00 AWST (32h) becomes [Fri 22:00->midnight, Sat 00:00->24:00, Sun
+    00:00->06:00]. Returns None if that split would cover more than
+    MAX_SHIFT_SPAN_DAYS calendar days — caller should skip instead of
+    splitting into that many shifts. (Confirmed with the user 2026-08-18
+    after the initial calendar-day-triggered version wrongly split a
+    same-night 8pm->2am shift in two.)
 
     full_day=True (Current RMS "Day Rate" services) makes every returned
-    segment the FULL Perth calendar day (00:00->24:00), ignoring the actual
-    time-of-day in start/end — this is how a day-rate service is
-    represented on the Connecteam side, since Connecteam's own "all day"
-    shift flag is accepted by its public API but silently has no effect
-    (confirmed 2026-08-18 via direct testing: create + read-back showed no
-    trace of the field at all, same failure mode as the documented
-    isOpenShift/numOfUsers multi-slot limitation)."""
+    segment the FULL Perth calendar day (00:00->24:00) — anchored to
+    start's day when duration <=24h — ignoring the actual time-of-day in
+    start/end. This is how a day-rate service is represented on the
+    Connecteam side, since Connecteam's own "all day" shift flag is
+    accepted by its public API but silently has no effect (confirmed
+    2026-08-18 via direct testing: create + read-back showed no trace of
+    the field at all, same failure mode as the documented isOpenShift/
+    numOfUsers multi-slot limitation)."""
     start_dt = datetime.fromtimestamp(start, tz=PERTH_TZ)
-    end_dt = datetime.fromtimestamp(end, tz=PERTH_TZ)
     start_day = start_dt.date()
+
+    if end - start <= MAX_SHIFT_SECONDS:
+        if full_day:
+            day_start = datetime(start_day.year, start_day.month, start_day.day, tzinfo=PERTH_TZ)
+            return [(int(day_start.timestamp()), int((day_start + timedelta(days=1)).timestamp()))]
+        return [(start, end)]
+
+    end_dt = datetime.fromtimestamp(end, tz=PERTH_TZ)
     end_day = end_dt.date()
     if (end_day - start_day).days + 1 > MAX_SHIFT_SPAN_DAYS:
         return None
