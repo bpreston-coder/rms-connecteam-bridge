@@ -390,7 +390,10 @@ def _to_epoch_seconds(iso_ts: str) -> int:
 
 
 def _format_epoch(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%a %d %b %Y, %H:%M UTC")
+    """Used in ops-facing Chat notifications only — local (Perth) time,
+    not UTC, since that's what the times actually mean to crew reading the
+    message. Confirmed with the user 2026-08-18."""
+    return datetime.fromtimestamp(ts, tz=PERTH_TZ).strftime("%a %d %b %Y, %H:%M AWST")
 
 
 def _split_into_daily_segments(
