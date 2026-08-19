@@ -1040,26 +1040,49 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     # near-identical pings for what's really one underlying change is just
     # noise (confirmed with the user 2026-08-18 after exactly that: a title
     # rename fanned out to 2 separate notifications for 2 shifts).
+    # jobId -> Job title, so the notification can name the Job rather than
+    # show its opaque Connecteam ID.
+    job_id_to_title = {v: k for k, v in job_title_cache.get("by_title", {}).items()}
+
+    def _job_label(job_id: str | None) -> str:
+        if not job_id:
+            return "(none)"
+        return job_id_to_title.get(job_id, job_id)
+
     published_edit_blocks: list[str] = []
     for (key, _, desired), shift_obj in zip(to_update, updated_shifts):
         if shift_obj.get("isPublished"):
             previous = previous_by_key.get(key, {})
             changes: list[str] = []
+            if previous.get("jobId") != desired.get("jobId"):
+                changes.append(
+                    f"Job — Original: {_job_label(previous.get('jobId'))}, "
+                    f"Updated to: {_job_label(desired.get('jobId'))}"
+                )
             if previous.get("startTime") != desired.get("startTime") or previous.get("endTime") != desired.get(
                 "endTime"
             ):
                 changes.append(
-                    f"Time: {_format_epoch(previous['startTime'])} – {_format_epoch(previous['endTime'])} "
-                    f"→ {_format_epoch(desired['startTime'])} – {_format_epoch(desired['endTime'])}"
+                    f"Time — Original: {_format_epoch(previous['startTime'])} – {_format_epoch(previous['endTime'])}, "
+                    f"Updated to: {_format_epoch(desired['startTime'])} – {_format_epoch(desired['endTime'])}"
                 )
             if previous.get("title") != desired.get("title"):
-                changes.append(f'Title: "{previous.get("title")}" → "{desired.get("title")}"')
+                changes.append(
+                    f'Title — Original: "{previous.get("title")}", Updated to: "{desired.get("title")}"'
+                )
             if previous.get("quantity") != desired.get("quantity"):
-                changes.append(f"Quantity required: {previous.get('quantity')} → {desired.get('quantity')}")
+                changes.append(
+                    f"Quantity required — Original: {previous.get('quantity')}, Updated to: {desired.get('quantity')}"
+                )
             if previous.get("address") != desired.get("address"):
-                changes.append(f"Address: {previous.get('address')} → {desired.get('address')}")
+                changes.append(
+                    f"Address — Original: {previous.get('address')}, Updated to: {desired.get('address')}"
+                )
             if previous.get("description") != desired.get("description"):
-                changes.append(f'Notes: "{previous.get("description")}" → "{desired.get("description")}"')
+                changes.append(
+                    f'Notes — Original: "{previous.get("description")}", '
+                    f'Updated to: "{desired.get("description")}"'
+                )
             change_text = "\n".join(f"  • {c}" for c in changes) if changes else "  (no tracked-field change detected)"
             published_edit_blocks.append(
                 f"Shift \"{desired.get('title')}\" ({shift_obj['id']}):\n{change_text}"
@@ -1071,7 +1094,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         notify_ops(
             client,
             f"✏️ {published_edits} published Connecteam {shift_word} edited by sync.\n"
-            f"Opportunity {opportunity_id} (order {order_number}):\n\n"
+            f"{subject} — Order {order_number} (Opportunity {opportunity_id}):\n\n"
             + "\n\n".join(published_edit_blocks)
             + "\n\nPlease confirm crew are aware of the change.",
         )
