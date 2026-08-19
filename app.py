@@ -650,6 +650,7 @@ def _cleanup_shift_keys(
     shifts_state: dict[str, Any],
     opportunity_id: int,
     reason: str,
+    job_title_cache: dict[str, Any],
 ) -> dict[str, Any]:
     """Shared teardown for a set of tracked shift keys that should no longer
     exist (whole opportunity ineligible, or an individual service item gone
@@ -664,6 +665,8 @@ def _cleanup_shift_keys(
     that way), so the published-deletion notification is batched into ONE
     Chat message rather than one per shift, same as the published-edit
     notification in sync_opportunity."""
+    job_id_to_title = {v: k for k, v in job_title_cache.get("by_title", {}).items()}
+
     deleted = 0
     already_gone = 0
     deleted_published_blocks: list[str] = []
@@ -678,7 +681,8 @@ def _cleanup_shift_keys(
         if shift.get("isPublished"):
             order_number = shifts_state[key].get("orderNumber") or order_number
             title = shifts_state[key].get("title")
-            deleted_published_blocks.append(f'"{title}" ({shift_id})')
+            job_label = job_id_to_title.get(shifts_state[key].get("jobId"), "(no Job)")
+            deleted_published_blocks.append(f'"{title}" — {job_label} ({shift_id})')
         delete_shift(client, shift_id)
         deleted += 1
         del shifts_state[key]
@@ -713,7 +717,7 @@ def cleanup_ineligible_opportunity(
     if not keys:
         return {"status": "skipped", "reason": reason, "tracked_shifts": 0}
 
-    result = _cleanup_shift_keys(client, keys, shifts_state, opportunity_id, reason)
+    result = _cleanup_shift_keys(client, keys, shifts_state, opportunity_id, reason, state["job_title_cache"])
     return {"status": "cleaned_up", "reason": reason, **result}
 
 
@@ -809,7 +813,12 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     ]
     orphan_result = (
         _cleanup_shift_keys(
-            client, orphaned_keys, shifts_state, opportunity_id, "service item removed from opportunity"
+            client,
+            orphaned_keys,
+            shifts_state,
+            opportunity_id,
+            "service item removed from opportunity",
+            state["job_title_cache"],
         )
         if orphaned_keys
         else None
@@ -1085,7 +1094,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
                 )
             change_text = "\n".join(f"  • {c}" for c in changes) if changes else "  (no tracked-field change detected)"
             published_edit_blocks.append(
-                f"Shift \"{desired.get('title')}\" ({shift_obj['id']}):\n{change_text}"
+                f"Shift \"{desired.get('title')}\" — {_job_label(desired.get('jobId'))} "
+                f"({shift_obj['id']}):\n{change_text}"
             )
 
     published_edits = len(published_edit_blocks)
