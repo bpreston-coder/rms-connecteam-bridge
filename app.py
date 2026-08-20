@@ -20,31 +20,12 @@ Current RMS opportunity_item's ID:
   - If we've already created a shift for that item -> UPDATE that same
     shift in place if the title/time/job/quantity changed, otherwise do
     nothing.
-  - If the opportunity is no longer eligible (flag unticked, went dead/
-    lost/reverted, or was deleted outright — including a deletion the poll
-    discovers as a 404, not just one caught by webhook) -> DELETE every
-    shift we created for it, draft or already-published alike — the
-    underlying work is genuinely gone, so it's no longer real work someone
-    needs to show up for.
-  - Same teardown applies at the individual item level: if one service line
-    item is removed from an opportunity that's still otherwise eligible,
-    only that item's shift is deleted (again, draft or published).
-  - A Service line item spanning more than one Australia/Perth calendar day
-    becomes one shift PER calendar day it touches (see
-    _split_into_daily_segments), each independently created/updated/deleted
-    by opportunity_item-id + day-index. Beyond MAX_SHIFT_SPAN_DAYS calendar
-    days it's skipped instead, the same as an unschedulable time range.
-  - Whenever a published shift is deleted, or gets edited in place because
-    Current RMS changed under it, ops is notified in Google Chat (see
-    notify_ops / GOOGLE_CHAT_WEBHOOK_URL) so a human knows a shift crew may
-    already have been told about was just removed or changed — after the
-    fact, since by the time the message lands the action has already
-    happened (deliberate as of 2026-08-18; earlier versions of this bridge
-    left a published shift in place for manual review instead of deleting
-    it outright).
+  - If the opportunity is no longer eligible (flag unticked, or it went
+    dead/lost/reverted) -> DELETE any shifts we created that are still
+    draft; leave already-published shifts alone for manual review.
 This guarantees we never create duplicate shifts, no matter how many times
 an opportunity is processed (webhook retries, overlapping polls, re-
-conversions).
+conversions), and never silently blow away a shift someone has published.
 
 It also finds a Connecteam Job per Service line item (matched by service
 name, never created here), writes the Current RMS order number into the
@@ -93,37 +74,6 @@ CONNECTEAM_BASE_URL = os.environ.get("CONNECTEAM_BASE_URL", "https://api.connect
 # apart from anything real. Clear this env var when pointed at production.
 CONNECTEAM_JOB_PREFIX = os.environ.get("CONNECTEAM_JOB_PREFIX", "")
 
-# Some Current RMS Service names don't map 1:1 onto a Connecteam Job — either
-# because several distinct RMS services (e.g. daytime/overnight variants, or
-# per-city/per-distance-type variants) are meant to share ONE task-type Job,
-# or because the Job title in Connecteam has just diverged from the RMS
-# service name over time. Reviewed and confirmed with the user 2026-08-17
-# against the live Current RMS Service catalog and Connecteam Jobs list.
-# Keys are the exact Current RMS service["name"]; values are the exact
-# Connecteam Job title to look up instead. Services not listed here use
-# their own name unchanged (the historical 1:1 behavior).
-SERVICE_JOB_OVERRIDES: dict[str, str] = {
-    "Audio Engineer - FOH - Overnight 0000 - 0700 and Sunday": "Audio Engineer - FOH",
-    "Audio Engineer - MONS - Overnight 0000 - 0700 and Sunday": "Audio Engineer - MONS",
-    "Audio Engineer - Systems - Overnight 0000 - 0700 and Sunday": "Audio Engineer - Systems",
-    "Followspot operator - Overnight 0000 - 0700 and Sunday": "Follow spot operator",
-    "Lighting operator - Overnight 0000 - 0700 and Sunday": "Lighting Operator",
-    "Lighting system's technician - Overnight 0000 - 0700 and Sunday": "Lighting system's technician",
-    "Lighting technician - Overnight 0000 - 0700 and Sunday": "Lighting technician",
-    "Production manager - Overnight 0000 - 0700 and Sunday": "Production manager",
-    "Rigger - Overnight 0000 - 0700 and Sunday": "Rigger",
-    "Truck 8 Ton - Collection (Distance)": "Truck 8 Ton - Collection",
-    "Truck 8 Ton - Delivery (Distance)": "Truck 8 Ton - Delivery",
-    "Truck 8 Ton - Perth Collection": "Truck 8 Ton - Collection",
-    "Truck 8 Ton - Perth Collection (After hours and Weekend)": "Truck 8 Ton - Collection",
-    "Truck 8 Ton - Perth Delivery": "Truck 8 Ton - Delivery",
-    "Truck 8 Ton - Perth Delivery (After hours and Weekend)": "Truck 8 Ton - Delivery",
-    "Van 1 Ton Perth Collection": "Van 1 Ton Collection",
-    "Van 1 Ton Perth Collection  (After hours and Weekend)": "Van 1 Ton Collection",
-    "Van 1 Ton Perth Delivery": "Van 1 Ton Delivery",
-    "Van 1 Ton Perth Delivery (After hours and Weekend)": "Van 1 Ton Delivery",
-}
-
 # Shift custom field id for the "Job No." box in the shift editor (renamed
 # to "Opportunity No." by the user in the test schedule's UI). Captured live
 # from Connecteam's own web app request when saving that field on a shift —
@@ -164,49 +114,12 @@ WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 # live webhook token. Unset by default — the route 403s until this is set.
 BACKFILL_TOKEN = os.environ.get("BACKFILL_TOKEN", "")
 
-# Incoming webhook URL for the ops Google Chat space. Posted to whenever a
-# shift a human already published gets deleted during cleanup or edited by
-# the sync — both cases where a real person may have already told crew about
-# that shift. Unset by default: notify_ops() just logs and no-ops rather
-# than failing sync, so this is safe to leave unconfigured in test.
-GOOGLE_CHAT_WEBHOOK_URL = os.environ.get("GOOGLE_CHAT_WEBHOOK_URL", "")
-
 # Where we remember: (a) which Connecteam shift belongs to which Current RMS
 # opportunity_item (so we UPDATE instead of duplicating), and (b) how far
 # back the last poll checked, so the next poll only looks at what changed.
 STATE_FILE = Path(os.environ.get("STATE_FILE", "./processed_orders.json"))
 
 MAX_SHIFT_SECONDS = 24 * 60 * 60  # Connecteam: a shift can't exceed 24h.
-
-# A Service line item spanning more than one calendar day becomes one shift
-# PER Australia/Perth calendar day it touches (see _split_into_daily_segments)
-# instead of one shift skipped outright for exceeding MAX_SHIFT_SECONDS.
-# Perth (AWST) is fixed UTC+8 year-round — no DST to account for. Confirmed
-# with the user 2026-08-17. Beyond MAX_SHIFT_SPAN_DAYS calendar days, a
-# service goes back to being skipped (with a warning) rather than split —
-# guards against turning a genuinely long equipment-only booking (weeks or
-# months) into that many daily shifts.
-PERTH_TZ = timezone(timedelta(hours=8))
-MAX_SHIFT_SPAN_DAYS = 14
-
-# These Service line items are cost/allowance entries, not an actual crew
-# shift someone needs to turn up for — never synced to Connecteam. Matched
-# on the Current RMS service["name"] exactly. Confirmed with the user
-# 2026-08-18. An opportunity with only excluded services still gets its
-# other (non-excluded) items synced normally; if one of these was already
-# tracked from before this exclusion existed, it's cleaned up the same way
-# any other item removed from the opportunity would be (see the orphan
-# teardown in sync_opportunity), since fetch_service_items simply stops
-# returning it.
-EXCLUDED_SERVICE_NAMES = {"Per diem", "Accomodation - Per night"}
-
-# A Service line item's status_name once someone finalises/completes it in
-# Current RMS (after which Current RMS itself won't let it be edited
-# further). Once finalised, the bridge leaves its shift completely alone —
-# no create, no update, no delete, no notification — see
-# _expand_service_segments' protected_keys handling. Confirmed with the
-# user 2026-08-18.
-FINALISED_STATUS_NAME = "Completed"
 
 # Background poll: catches Service-item edits made *after* conversion (no
 # Current RMS webhook fires for those). Runs every POLL_INTERVAL_SECONDS.
@@ -373,10 +286,7 @@ def fetch_service_items(client: httpx.Client, opportunity_id: int) -> list[dict[
     return [
         item
         for item in items
-        if item.get("item_type") == "Service"
-        and item.get("starts_at")
-        and item.get("ends_at")
-        and item.get("name") not in EXCLUDED_SERVICE_NAMES
+        if item.get("item_type") == "Service" and item.get("starts_at") and item.get("ends_at")
     ]
 
 
@@ -387,72 +297,6 @@ def fetch_service_items(client: httpx.Client, opportunity_id: int) -> list[dict[
 def _to_epoch_seconds(iso_ts: str) -> int:
     dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
     return int(dt.astimezone(timezone.utc).timestamp())
-
-
-def _format_epoch(ts: int) -> str:
-    """Used in ops-facing Chat notifications only — local (Perth) time,
-    not UTC, since that's what the times actually mean to crew reading the
-    message. Confirmed with the user 2026-08-18."""
-    return datetime.fromtimestamp(ts, tz=PERTH_TZ).strftime("%a %d %b %Y, %H:%M AWST")
-
-
-def _split_into_daily_segments(
-    start: int, end: int, full_day: bool = False
-) -> list[tuple[int, int]] | None:
-    """Return the Connecteam shift segment(s) for [start, end) (unix epoch
-    seconds, end already confirmed > start by the caller).
-
-    Connecteam's actual constraint is a 24-HOUR DURATION limit, not a
-    calendar-day one — a single shift is free to cross midnight (e.g. 8pm
-    -> 2am, 6h) so that stays exactly ONE segment with its literal times,
-    not two pieces cut at the midnight boundary. Only once the span
-    genuinely exceeds MAX_SHIFT_SECONDS does it get split into one segment
-    per Australia/Perth calendar day it touches — e.g. Fri 22:00 -> Sun
-    06:00 AWST (32h) becomes [Fri 22:00->midnight, Sat 00:00->24:00, Sun
-    00:00->06:00]. Returns None if that split would cover more than
-    MAX_SHIFT_SPAN_DAYS calendar days — caller should skip instead of
-    splitting into that many shifts. (Confirmed with the user 2026-08-18
-    after the initial calendar-day-triggered version wrongly split a
-    same-night 8pm->2am shift in two.)
-
-    full_day=True (Current RMS "Day Rate" services) makes every returned
-    segment the FULL Perth calendar day (00:00->24:00) — anchored to
-    start's day when duration <=24h — ignoring the actual time-of-day in
-    start/end. This is how a day-rate service is represented on the
-    Connecteam side, since Connecteam's own "all day" shift flag is
-    accepted by its public API but silently has no effect (confirmed
-    2026-08-18 via direct testing: create + read-back showed no trace of
-    the field at all, same failure mode as the documented isOpenShift/
-    numOfUsers multi-slot limitation)."""
-    start_dt = datetime.fromtimestamp(start, tz=PERTH_TZ)
-    start_day = start_dt.date()
-
-    if end - start <= MAX_SHIFT_SECONDS:
-        if full_day:
-            day_start = datetime(start_day.year, start_day.month, start_day.day, tzinfo=PERTH_TZ)
-            return [(int(day_start.timestamp()), int((day_start + timedelta(days=1)).timestamp()))]
-        return [(start, end)]
-
-    end_dt = datetime.fromtimestamp(end, tz=PERTH_TZ)
-    end_day = end_dt.date()
-    if (end_day - start_day).days + 1 > MAX_SHIFT_SPAN_DAYS:
-        return None
-
-    segments: list[tuple[int, int]] = []
-    cursor = start
-    day = start_day
-    while day <= end_day:
-        day_start = datetime(day.year, day.month, day.day, tzinfo=PERTH_TZ)
-        next_midnight = day_start + timedelta(days=1)
-        if full_day:
-            segments.append((int(day_start.timestamp()), int(next_midnight.timestamp())))
-        else:
-            day_end = min(end, int(next_midnight.timestamp()))
-            if day_end > cursor:
-                segments.append((cursor, day_end))
-            cursor = day_end
-        day += timedelta(days=1)
-    return segments
 
 
 def _load_job_title_cache(client: httpx.Client) -> tuple[dict[str, str], dict[str, str]]:
@@ -498,22 +342,19 @@ def find_job_by_service_name(
     client: httpx.Client, service_name: str, jobs_state: dict[str, Any]
 ) -> str | None:
     """Look up the task-type Job whose title is
-    f"{CONNECTEAM_JOB_PREFIX}{SERVICE_JOB_OVERRIDES.get(service_name, service_name)}"
-    (e.g. "TEST Lighting Technician" while testing, or just "Lighting
-    Technician" in production) — most services map onto a Job of the same
-    name, but SERVICE_JOB_OVERRIDES redirects the handful that don't (see
-    its comment). Returns None — and logs a warning — if no matching Job
+    f"{CONNECTEAM_JOB_PREFIX}{service_name}" (e.g. "TEST Lighting
+    Technician" while testing, or just "Lighting Technician" in
+    production). Returns None — and logs a warning — if no matching Job
     exists; it does NOT create one. jobs_state is a title->jobId cache
     persisted in the state file so repeated syncs don't refetch the whole
     Jobs list every time."""
-    mapped_name = SERVICE_JOB_OVERRIDES.get(service_name, service_name)
     # Built with an explicit space rather than relying on a trailing space
     # surviving inside CONNECTEAM_JOB_PREFIX itself — env var UIs (Render
     # included) tend to silently trim trailing whitespace on save, which
     # would otherwise turn "TEST Lighting technician" into
     # "TESTLighting technician" and break every lookup.
     prefix = CONNECTEAM_JOB_PREFIX.strip()
-    title = f"{prefix} {mapped_name}" if prefix else mapped_name
+    title = f"{prefix} {service_name}" if prefix else service_name
 
     cache: dict[str, str] = jobs_state.setdefault("by_title", {})
     color_cache: dict[str, str] = jobs_state.setdefault("by_jobid_color", {})
@@ -604,20 +445,6 @@ def update_shifts(client: httpx.Client, payloads: list[dict[str, Any]]) -> list[
     return updated
 
 
-def notify_ops(client: httpx.Client, text: str) -> None:
-    """Post a message to the ops Google Chat space. Best-effort: logs and
-    swallows failures instead of raising, so a Chat outage never breaks a
-    sync that otherwise succeeded."""
-    if not GOOGLE_CHAT_WEBHOOK_URL:
-        log.warning("GOOGLE_CHAT_WEBHOOK_URL not set — skipping ops notification: %s", text)
-        return
-    try:
-        resp = client.post(GOOGLE_CHAT_WEBHOOK_URL, json={"text": text})
-        resp.raise_for_status()
-    except httpx.HTTPError:
-        log.exception("Failed to post ops notification to Google Chat: %s", text)
-
-
 def get_shift(client: httpx.Client, shift_id: str) -> dict[str, Any] | None:
     """Fetch a single shift; returns None if it no longer exists (e.g.
     already deleted by hand in Connecteam)."""
@@ -644,33 +471,24 @@ def delete_shift(client: httpx.Client, shift_id: str) -> None:
         resp.raise_for_status()
 
 
-def _cleanup_shift_keys(
-    client: httpx.Client,
-    keys: list[str],
-    shifts_state: dict[str, Any],
-    opportunity_id: int,
-    reason: str,
-    job_title_cache: dict[str, Any],
+def cleanup_ineligible_opportunity(
+    client: httpx.Client, opportunity_id: int, reason: str, state: dict[str, Any]
 ) -> dict[str, Any]:
-    """Shared teardown for a set of tracked shift keys that should no longer
-    exist (whole opportunity ineligible, or an individual service item gone
-    from an opportunity that's otherwise still eligible) — deleted outright
-    from Connecteam, draft or already-published alike. Ops is notified
-    afterwards rather than being asked to act, since the deletion has
-    already happened by the time the message lands (confirmed with the
-    user 2026-08-18 — a deliberate reversal of the earlier "never touch a
-    published shift" safety net: a shift whose underlying Current RMS item
-    is genuinely gone is no longer real work someone needs to show up for).
-    All keys passed in belong to one opportunity (every caller scopes it
-    that way), so the published-deletion notification is batched into ONE
-    Chat message rather than one per shift, same as the published-edit
-    notification in sync_opportunity."""
-    job_id_to_title = {v: k for k, v in job_title_cache.get("by_title", {}).items()}
+    """An opportunity that used to be eligible (Order, or flagged Quotation)
+    no longer is — flag was unticked, or it went dead/lost/reverted.
+    Draft (unpublished) shifts we created for it are deleted automatically.
+    Published shifts are left alone — a human has already put real
+    scheduling work into a published shift, so this only deletes what's
+    still safely a draft. (Notifying ops about left-behind published shifts
+    is planned but not wired up yet.)"""
+    shifts_state: dict[str, Any] = state["shifts"]
+    keys = [k for k, v in shifts_state.items() if v.get("opportunityId") == opportunity_id]
+    if not keys:
+        return {"status": "skipped", "reason": reason, "tracked_shifts": 0}
 
     deleted = 0
+    left_published = 0
     already_gone = 0
-    deleted_published_blocks: list[str] = []
-    order_number = None
     for key in keys:
         shift_id = shifts_state[key]["shiftId"]
         shift = get_shift(client, shift_id)
@@ -679,104 +497,30 @@ def _cleanup_shift_keys(
             del shifts_state[key]
             continue
         if shift.get("isPublished"):
-            order_number = shifts_state[key].get("orderNumber") or order_number
-            title = shifts_state[key].get("title")
-            job_label = job_id_to_title.get(shifts_state[key].get("jobId"), "(no Job)")
-            deleted_published_blocks.append(f'"{title}" — {job_label} ({shift_id})')
+            left_published += 1
+            log.warning(
+                "Opportunity %s is no longer eligible (%s) but shift %s is already published — "
+                "leaving it in place for manual review.",
+                opportunity_id, reason, shift_id,
+            )
+            continue
         delete_shift(client, shift_id)
         deleted += 1
         del shifts_state[key]
 
-    if deleted_published_blocks:
-        shift_word = "shift has" if len(deleted_published_blocks) == 1 else "shifts have"
-        notify_ops(
-            client,
-            f"🗑️ Published Connecteam {shift_word} been deleted — no longer required.\n"
-            f"Opportunity {opportunity_id} (order {order_number}) — {reason}.\n"
-            + "\n".join(deleted_published_blocks),
-        )
-
     return {
+        "status": "cleaned_up",
+        "reason": reason,
         "tracked_shifts": len(keys),
-        "deleted_count": deleted,
-        "deleted_published_count": len(deleted_published_blocks),
+        "deleted_draft_count": deleted,
+        "left_published_count": left_published,
         "already_gone_count": already_gone,
     }
-
-
-def cleanup_ineligible_opportunity(
-    client: httpx.Client, opportunity_id: int, reason: str, state: dict[str, Any]
-) -> dict[str, Any]:
-    """An opportunity that used to be eligible (Order, or flagged Quotation)
-    no longer is — flag was unticked, it went dead/lost/reverted, or it was
-    deleted outright. All shifts tracked for it are torn down via
-    _cleanup_shift_keys (deleted outright, draft or published; ops notified
-    afterwards for anything that was published)."""
-    shifts_state: dict[str, Any] = state["shifts"]
-    keys = [k for k, v in shifts_state.items() if v.get("opportunityId") == opportunity_id]
-    if not keys:
-        return {"status": "skipped", "reason": reason, "tracked_shifts": 0}
-
-    result = _cleanup_shift_keys(client, keys, shifts_state, opportunity_id, reason, state["job_title_cache"])
-    return {"status": "cleaned_up", "reason": reason, **result}
 
 
 # ---------------------------------------------------------------------------
 # Core sync — idempotent, keyed off Current RMS opportunity_item IDs
 # ---------------------------------------------------------------------------
-
-def _expand_service_segments(
-    services: list[dict[str, Any]],
-) -> tuple[list[tuple[str, dict[str, Any], int, int]], list[tuple[str, str]], set[str]]:
-    """Turn each dated Service line item into one or more (key, service,
-    start, end) rows — one per Australia/Perth calendar day it spans (see
-    _split_into_daily_segments). A same-day item keeps its plain
-    str(service["id"]) key, unchanged from before day-splitting existed, so
-    already-tracked single-day shifts are never mistaken for orphans or
-    recreated under a new key; a multi-day item's per-day rows get
-    "{id}:{day_index}" keys instead. A "Day Rate" service (Current RMS
-    service_rate_type_name == "Day") gets full 00:00->24:00 Perth segments
-    regardless of its literal starts_at/ends_at time-of-day — see
-    _split_into_daily_segments' full_day parameter for why.
-
-    A FINALISED_STATUS_NAME service (Current RMS status_name == "Completed"
-    — set once someone finalises/completes it, after which Current RMS
-    itself won't let it be edited further) is deliberately left OUT of
-    `expanded`, so nothing about its shift is ever created/updated. Its
-    key(s) still go into `protected_keys` though, so the caller's orphan
-    detection treats it as still present rather than removed — the whole
-    point is that nothing happens to it either way, not that its existing
-    shift gets torn down. Confirmed with the user 2026-08-18.
-
-    Returns (expanded, skipped, protected_keys) — skipped covers items that
-    can't be scheduled at all (bad times, or a span longer than
-    MAX_SHIFT_SPAN_DAYS calendar days)."""
-    expanded: list[tuple[str, dict[str, Any], int, int]] = []
-    skipped: list[tuple[str, str]] = []
-    protected_keys: set[str] = set()
-    for service in services:
-        start = _to_epoch_seconds(service["starts_at"])
-        end = _to_epoch_seconds(service["ends_at"])
-        if end <= start:
-            skipped.append((service["name"], "end time is not after start time"))
-            continue
-
-        full_day = service.get("service_rate_type_name") == "Day"
-        segments = _split_into_daily_segments(start, end, full_day=full_day)
-        if segments is None:
-            skipped.append((service["name"], f"span exceeds {MAX_SHIFT_SPAN_DAYS}-day split cap"))
-            continue
-
-        finalised = service.get("status_name") == FINALISED_STATUS_NAME
-        single_day = len(segments) == 1
-        for day_index, (seg_start, seg_end) in enumerate(segments):
-            key = str(service["id"]) if single_day else f"{service['id']}:{day_index}"
-            if finalised:
-                protected_keys.add(key)
-                continue
-            expanded.append((key, service, seg_start, seg_end))
-    return expanded, skipped, protected_keys
-
 
 def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str, Any]) -> dict[str, Any]:
     """Create/update draft Connecteam shifts for one order, and its linked
@@ -792,43 +536,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         return {"status": "skipped", "reason": reason, **cleanup_result}
 
     services = fetch_service_items(client, opportunity_id)
-    shifts_state: dict[str, Any] = state["shifts"]
-
-    # A service line item that's tracked (we made a shift for it before) but
-    # no longer shows up here — deleted from the opportunity, or had its
-    # dates cleared — is torn down the same way a whole ineligible
-    # opportunity is: deleted outright (draft or published), Chat notified
-    # if it was published. Same applies to a single-day-turned-multi-day (or
-    # vice versa) item's now-stale key, since _expand_service_segments
-    # changes key format between the two cases — current_keys covers every
-    # key that SHOULD exist right now (split or not) PLUS every finalised
-    # item's key, so a finalised item's shift is protected from this
-    # teardown rather than treated as removed (see protected_keys).
-    expanded_segments, segment_skips, protected_keys = _expand_service_segments(services)
-    current_keys = {key for key, _, _, _ in expanded_segments} | protected_keys
-    orphaned_keys = [
-        k
-        for k, v in shifts_state.items()
-        if v.get("opportunityId") == opportunity_id and k not in current_keys
-    ]
-    orphan_result = (
-        _cleanup_shift_keys(
-            client,
-            orphaned_keys,
-            shifts_state,
-            opportunity_id,
-            "service item removed from opportunity",
-            state["job_title_cache"],
-        )
-        if orphaned_keys
-        else None
-    )
-
     if not services:
-        result: dict[str, Any] = {"status": "skipped", "reason": "no dated Service line items found"}
-        if orphan_result:
-            result["orphaned_items_cleaned_up"] = orphan_result
-        return result
+        return {"status": "skipped", "reason": "no dated Service line items found"}
 
     address = fetch_venue_address(client, opportunity)
     order_number = opportunity.get("number")
@@ -837,17 +546,28 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     subject = opportunity.get("subject") or f"Order {opportunity.get('number', opportunity['id'])}"
     if "#" in subject:
         subject = subject.split("#", 1)[1].strip()
+    shifts_state: dict[str, Any] = state["shifts"]
 
     to_create: list[tuple[str, dict[str, Any], dict[str, Any]]] = []  # (key, payload, desired)
     to_update: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     unchanged = 0
-    skipped: list[tuple[str, str]] = list(segment_skips)
+    skipped: list[tuple[str, str]] = []
     # Service name per shift key, kept so a stale-Job-ID retry (see
     # _is_stale_job_id_error below) can redo the title lookup after a forced
     # cache refresh without re-walking the Current RMS service items.
     service_name_by_key: dict[str, str] = {}
 
-    for key, service, start, end in expanded_segments:
+    for service in services:
+        start = _to_epoch_seconds(service["starts_at"])
+        end = _to_epoch_seconds(service["ends_at"])
+
+        if end <= start:
+            skipped.append((service["name"], "end time is not after start time"))
+            continue
+        if end - start > MAX_SHIFT_SECONDS:
+            skipped.append((service["name"], "duration exceeds Connecteam's 24h shift limit"))
+            continue
+
         # Job = task type, matched by Service name (e.g. "Lighting
         # Technician") — never created per-order. The opportunity name only
         # ever goes into the shift title text, per the corrected design.
@@ -881,6 +601,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         # what the line item is actually for.
         description = (service.get("description") or "").strip()
 
+        key = str(service["id"])
         service_name_by_key[key] = service["name"]
         desired = {
             "opportunityId": opportunity_id,
@@ -979,8 +700,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     def _rebuild_job_fields(payload: dict[str, Any], desired: dict[str, Any], key: str) -> None:
         prefix = CONNECTEAM_JOB_PREFIX.strip()
         service_name = service_name_by_key[key]
-        mapped_name = SERVICE_JOB_OVERRIDES.get(service_name, service_name)
-        title = f"{prefix} {mapped_name}" if prefix else mapped_name
+        title = f"{prefix} {service_name}" if prefix else service_name
         job_id = job_title_cache.get("by_title", {}).get(title)
         job_color = job_id and job_title_cache.get("by_jobid_color", {}).get(job_id)
         payload.pop("jobId", None)
@@ -1030,96 +750,18 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             _rebuild_job_fields(payload, desired, key)
         updated_shifts = update_shifts(client, [p for _, p, _ in to_update])
 
-    # Snapshot pre-update state before it's overwritten below, so the
-    # published-edit notification can describe exactly what changed.
-    previous_by_key = {key: dict(shifts_state.get(key, {})) for key, _, _ in to_update}
-
     for key, _, desired in to_update:
         existing = shifts_state.get(key, {})
         existing.update(desired)
         shifts_state[key] = existing
 
-    # A shift someone already published can still be in to_update (nothing
-    # here checks publish state before editing — Current RMS changes are
-    # still pushed through). Ops gets a heads-up, with specifics, so crew
-    # who were told about the original time/details aren't caught out by a
-    # silent change. Batched into ONE Chat message for this whole sync call
-    # rather than one per shift — a single RMS edit (e.g. renaming the
-    # order) can touch every shift on the opportunity at once, and a wall of
-    # near-identical pings for what's really one underlying change is just
-    # noise (confirmed with the user 2026-08-18 after exactly that: a title
-    # rename fanned out to 2 separate notifications for 2 shifts).
-    # jobId -> Job title, so the notification can name the Job rather than
-    # show its opaque Connecteam ID.
-    job_id_to_title = {v: k for k, v in job_title_cache.get("by_title", {}).items()}
-
-    def _job_label(job_id: str | None) -> str:
-        if not job_id:
-            return "(none)"
-        return job_id_to_title.get(job_id, job_id)
-
-    published_edit_blocks: list[str] = []
-    for (key, _, desired), shift_obj in zip(to_update, updated_shifts):
-        if shift_obj.get("isPublished"):
-            previous = previous_by_key.get(key, {})
-            changes: list[str] = []
-            if previous.get("jobId") != desired.get("jobId"):
-                changes.append(
-                    f"Job — Original: {_job_label(previous.get('jobId'))}, "
-                    f"Updated to: {_job_label(desired.get('jobId'))}"
-                )
-            if previous.get("startTime") != desired.get("startTime") or previous.get("endTime") != desired.get(
-                "endTime"
-            ):
-                changes.append(
-                    f"Time — Original: {_format_epoch(previous['startTime'])} – {_format_epoch(previous['endTime'])}, "
-                    f"Updated to: {_format_epoch(desired['startTime'])} – {_format_epoch(desired['endTime'])}"
-                )
-            if previous.get("title") != desired.get("title"):
-                changes.append(
-                    f'Title — Original: "{previous.get("title")}", Updated to: "{desired.get("title")}"'
-                )
-            if previous.get("quantity") != desired.get("quantity"):
-                changes.append(
-                    f"Quantity required — Original: {previous.get('quantity')}, Updated to: {desired.get('quantity')}"
-                )
-            if previous.get("address") != desired.get("address"):
-                changes.append(
-                    f"Address — Original: {previous.get('address')}, Updated to: {desired.get('address')}"
-                )
-            if previous.get("description") != desired.get("description"):
-                changes.append(
-                    f'Notes — Original: "{previous.get("description")}", '
-                    f'Updated to: "{desired.get("description")}"'
-                )
-            change_text = "\n".join(f"  • {c}" for c in changes) if changes else "  (no tracked-field change detected)"
-            published_edit_blocks.append(
-                f"Shift \"{desired.get('title')}\" — {_job_label(desired.get('jobId'))} "
-                f"({shift_obj['id']}):\n{change_text}"
-            )
-
-    published_edits = len(published_edit_blocks)
-    if published_edit_blocks:
-        shift_word = "shift" if published_edits == 1 else "shifts"
-        notify_ops(
-            client,
-            f"✏️ {published_edits} published Connecteam {shift_word} edited by sync.\n"
-            f"{subject} — Order {order_number} (Opportunity {opportunity_id}):\n\n"
-            + "\n\n".join(published_edit_blocks)
-            + "\n\nPlease confirm crew are aware of the change.",
-        )
-
-    result = {
+    return {
         "status": "ok",
         "created_count": len(created_shifts),
         "updated_count": len(updated_shifts),
         "unchanged_count": unchanged,
         "skipped_count": len(skipped),
-        "published_edits_count": published_edits,
     }
-    if orphan_result:
-        result["orphaned_items_cleaned_up"] = orphan_result
-    return result
 
 
 def poll_all_open_orders() -> dict[str, Any]:
@@ -1141,25 +783,11 @@ def poll_all_open_orders() -> dict[str, Any]:
                 try:
                     results[str(opportunity_id)] = sync_opportunity(client, opportunity_id, state)
                 except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 404:
-                        # Opportunity was deleted and the poll (not the webhook) is
-                        # what found out — clean up the same way the webhook's
-                        # Action_type=="destroy" path does, instead of leaving
-                        # orphaned shifts to 404 again every subsequent poll.
-                        log.warning(
-                            "Opportunity %s 404'd during poll — treating as deleted and cleaning up",
-                            opportunity_id,
-                        )
-                        cleanup_result = cleanup_ineligible_opportunity(
-                            client, opportunity_id, "deleted (404 on poll)", state
-                        )
-                        results[str(opportunity_id)] = {"status": "skipped", "reason": "deleted", **cleanup_result}
-                    else:
-                        log.exception("Poll failed for opportunity %s", opportunity_id)
-                        results[str(opportunity_id)] = {
-                            "status": "error",
-                            "detail": f"{exc.response.status_code} {exc.response.text[:300]}",
-                        }
+                    log.exception("Poll failed for opportunity %s", opportunity_id)
+                    results[str(opportunity_id)] = {
+                        "status": "error",
+                        "detail": f"{exc.response.status_code} {exc.response.text[:300]}",
+                    }
 
         state["poll_cursor"] = (poll_start - timedelta(minutes=POLL_OVERLAP_MINUTES)).isoformat()
         _save_state(state)
@@ -1250,13 +878,16 @@ async def manual_sync(token: str | None = None):
 async def debug_inspect_sync(opportunity_id: int, token: str | None = None):
     """TEMPORARY, diagnostic only, no writes. User reports some shifts exist
     in Connecteam but the "Shift Type/Notes" custom field is blank even
-    after a successful backfill. For each dated Service item on this
-    opportunity, returns the raw Current RMS description, the tracked state
-    entry (shiftId + last-synced description), and the LIVE Connecteam
-    shift's actual customFields — so we can tell apart "source description
-    is genuinely blank" from "we computed a value but never sent/received
-    it". Protected by BACKFILL_TOKEN (reused — diagnostic, not a write).
-    Remove this route once the mismatch is understood."""
+    after a successful backfill, and separately asked to confirm the
+    user-selected Job colors are actually landing on shifts. For each dated
+    Service item on this opportunity, returns the raw Current RMS
+    description, the tracked state entry (shiftId + last-synced
+    description/color), the LIVE Connecteam shift's actual customFields +
+    color + jobId, and — fetched fresh, bypassing our cache — the Job's
+    current live color, so we can tell "source description is genuinely
+    blank" / "shift never got the color" apart from "cache is stale".
+    Protected by BACKFILL_TOKEN (reused — diagnostic, not a write). Remove
+    this route once the mismatch is understood."""
     if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
         raise HTTPException(status_code=403, detail="invalid or missing token")
 
@@ -1265,24 +896,26 @@ async def debug_inspect_sync(opportunity_id: int, token: str | None = None):
         shifts_state: dict[str, Any] = state["shifts"]
         with httpx.Client(timeout=30) as client:
             services = fetch_service_items(client, opportunity_id)
-            expanded_segments, _, _ = _expand_service_segments(services)
+            _, live_by_jobid_color = _load_job_title_cache(client)
             rows = []
-            for key, service, seg_start, seg_end in expanded_segments:
+            for service in services:
+                key = str(service["id"])
                 existing = shifts_state.get(key)
                 row: dict[str, Any] = {
-                    "key": key,
                     "service_item_id": service["id"],
                     "service_name": service["name"],
-                    "segment_start": seg_start,
-                    "segment_end": seg_end,
                     "raw_description": service.get("description"),
                     "tracked_state": existing,
                 }
                 if existing and existing.get("shiftId"):
                     shift = get_shift(client, existing["shiftId"])
-                    row["live_shift_customFields"] = (
-                        shift.get("customFields") if shift else "SHIFT NOT FOUND (404)"
-                    )
+                    if shift:
+                        row["live_shift_customFields"] = shift.get("customFields")
+                        row["live_shift_color"] = shift.get("color")
+                        row["live_shift_jobId"] = shift.get("jobId")
+                        row["live_job_current_color"] = live_by_jobid_color.get(shift.get("jobId"))
+                    else:
+                        row["live_shift_customFields"] = "SHIFT NOT FOUND (404)"
                 rows.append(row)
             return {"opportunity_id": opportunity_id, "services": rows}
 
