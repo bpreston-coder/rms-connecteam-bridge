@@ -543,6 +543,20 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     order_number = opportunity.get("number")
     job_title_cache: dict[str, Any] = state["job_title_cache"]
 
+    # Refresh the whole Job title/color cache once per sync. The cache used
+    # to only auto-refresh on a title *miss*, so once a jobId was cached its
+    # color was trusted forever — if a user later changed that Job's color
+    # in Connecteam, already-synced shifts would never pick it up (confirmed
+    # live via /debug/inspect-sync: two shifts' live "color" no longer
+    # matched their Job's actual current color). Jobs lists are small
+    # (~60 in this account), so one extra API call per opportunity sync is
+    # cheap insurance against silently stale colors.
+    _fresh_by_title, _fresh_by_jobid_color = _load_job_title_cache(client)
+    job_title_cache.setdefault("by_title", {}).clear()
+    job_title_cache["by_title"].update(_fresh_by_title)
+    job_title_cache.setdefault("by_jobid_color", {}).clear()
+    job_title_cache["by_jobid_color"].update(_fresh_by_jobid_color)
+
     subject = opportunity.get("subject") or f"Order {opportunity.get('number', opportunity['id'])}"
     if "#" in subject:
         subject = subject.split("#", 1)[1].strip()
