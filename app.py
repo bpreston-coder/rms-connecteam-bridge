@@ -912,7 +912,28 @@ async def debug_inspect_sync(
                 resp.raise_for_status()
                 found = resp.json().get("opportunities", [])
                 if not found:
-                    return {"error": f"no opportunity found with number {order_number!r}"}
+                    # Exact match failed — try a contains search in case the
+                    # order number carries a prefix/suffix we don't know
+                    # about (e.g. "ORD-4012"), and surface all matches
+                    # rather than silently picking one.
+                    resp2 = client.get(
+                        f"{CURRENT_RMS_BASE_URL}/api/v1/opportunities",
+                        headers=rms_headers(),
+                        params={"q[number_cont]": order_number, "per_page": 10},
+                    )
+                    resp2.raise_for_status()
+                    found2 = resp2.json().get("opportunities", [])
+                    if not found2:
+                        return {"error": f"no opportunity found with number {order_number!r}"}
+                    if len(found2) > 1:
+                        return {
+                            "error": f"multiple opportunities match number contains {order_number!r}",
+                            "candidates": [
+                                {"id": o["id"], "number": o.get("number"), "subject": o.get("subject")}
+                                for o in found2
+                            ],
+                        }
+                    found = found2
                 resolved_id = found[0]["id"]
 
             services = fetch_service_items(client, resolved_id)
