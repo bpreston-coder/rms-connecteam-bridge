@@ -875,7 +875,9 @@ async def manual_sync(token: str | None = None):
 
 
 @app.get("/debug/inspect-sync")
-async def debug_inspect_sync(opportunity_id: int, token: str | None = None):
+async def debug_inspect_sync(
+    opportunity_id: int | None = None, order_number: str | None = None, token: str | None = None
+):
     """TEMPORARY, diagnostic only, no writes. User reports some shifts exist
     in Connecteam but the "Shift Type/Notes" custom field is blank even
     after a successful backfill, and separately asked to confirm the
@@ -885,17 +887,35 @@ async def debug_inspect_sync(opportunity_id: int, token: str | None = None):
     description/color), the LIVE Connecteam shift's actual customFields +
     color + jobId, and — fetched fresh, bypassing our cache — the Job's
     current live color, so we can tell "source description is genuinely
-    blank" / "shift never got the color" apart from "cache is stale".
+    blank" / "shift never got the color" apart from "cache is stale". Pass
+    either opportunity_id (Current RMS internal id) or order_number (the
+    human-facing order # shown in Connecteam shift titles) — order_number
+    is resolved to an opportunity_id first via a Current RMS search.
     Protected by BACKFILL_TOKEN (reused — diagnostic, not a write). Remove
     this route once the mismatch is understood."""
     if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
         raise HTTPException(status_code=403, detail="invalid or missing token")
+    if opportunity_id is None and not order_number:
+        raise HTTPException(status_code=400, detail="pass opportunity_id or order_number")
 
     def _run() -> dict[str, Any]:
         state = _load_state()
         shifts_state: dict[str, Any] = state["shifts"]
         with httpx.Client(timeout=30) as client:
-            services = fetch_service_items(client, opportunity_id)
+            resolved_id = opportunity_id
+            if resolved_id is None:
+                resp = client.get(
+                    f"{CURRENT_RMS_BASE_URL}/api/v1/opportunities",
+                    headers=rms_headers(),
+                    params={"q[number_eq]": order_number, "per_page": 5},
+                )
+                resp.raise_for_status()
+                found = resp.json().get("opportunities", [])
+                if not found:
+                    return {"error": f"no opportunity found with number {order_number!r}"}
+                resolved_id = found[0]["id"]
+
+            services = fetch_service_items(client, resolved_id)
             _, live_by_jobid_color = _load_job_title_cache(client)
             rows = []
             for service in services:
@@ -917,7 +937,7 @@ async def debug_inspect_sync(opportunity_id: int, token: str | None = None):
                     else:
                         row["live_shift_customFields"] = "SHIFT NOT FOUND (404)"
                 rows.append(row)
-            return {"opportunity_id": opportunity_id, "services": rows}
+            return {"opportunity_id": resolved_id, "services": rows}
 
     result = await asyncio.to_thread(_run)
     return JSONResponse(result)
