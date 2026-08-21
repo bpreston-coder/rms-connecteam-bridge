@@ -653,6 +653,23 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         ]
 
         existing = shifts_state.get(key)
+        if existing is not None:
+            # Verify the tracked shift still exists before trusting it for
+            # a diff — a human can delete a shift directly in Connecteam,
+            # and without this check the app would keep believing it's
+            # still there (comparing against tracked state only, never
+            # Connecteam) and silently never recreate it. Confirmed live
+            # via /debug/inspect-sync: one shift on order #4012 had been
+            # deleted this way and stayed missing indefinitely.
+            live_shift = get_shift(client, existing["shiftId"])
+            if live_shift is None:
+                log.warning(
+                    "Tracked shift %s for opportunity %s (service item %s) no longer "
+                    "exists in Connecteam — recreating it.",
+                    existing["shiftId"], opportunity_id, key,
+                )
+                del shifts_state[key]
+                existing = None
         if existing is None:
             payload: dict[str, Any] = {
                 "startTime": start,
@@ -973,6 +990,54 @@ async def debug_inspect_sync(
                         row["live_shift_customFields"] = "SHIFT NOT FOUND (404)"
                 rows.append(row)
             return {"opportunity_id": resolved_id, "services": rows}
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
+@app.get("/debug/list-duplicate-jobs")
+async def debug_list_duplicate_jobs(token: str | None = None):
+    """TEMPORARY, diagnostic only, no writes. Lists every Connecteam Job
+    title in this scheduler that has more than one Job entry (active or
+    not) — confirmed live to exist (e.g. two "Van 1 Ton Perth Delivery"
+    Jobs with different colors, two "Lighting Operator" Jobs one of which
+    is soft-deleted). The app has no way to know which duplicate is
+    "correct" for a title and just uses whichever the Jobs API happens to
+    list — user asked this be surfaced for manual cleanup in Connecteam.
+    Protected by BACKFILL_TOKEN (reused — diagnostic, not a write). Remove
+    this route once the user has reviewed the list."""
+    if not BACKFILL_TOKEN or not hmac.compare_digest(token or "", BACKFILL_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        all_jobs: list[dict[str, Any]] = []
+        with httpx.Client(timeout=30) as client:
+            offset = 0
+            while True:
+                resp = client.get(
+                    f"{CONNECTEAM_BASE_URL}/jobs/v1/jobs",
+                    headers=headers,
+                    params={"instanceIds": CONNECTEAM_SCHEDULER_ID, "limit": 500, "offset": offset},
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                jobs = body.get("data", {}).get("jobs", [])
+                all_jobs.extend(jobs)
+                if len(jobs) < 500:
+                    break
+                offset = body.get("paging", {}).get("offset", offset + 500)
+
+        by_title: dict[str, list[dict[str, Any]]] = {}
+        for j in all_jobs:
+            title = j.get("title")
+            if not title:
+                continue
+            by_title.setdefault(title, []).append(
+                {k: j.get(k) for k in ("jobId", "color", "isArchived", "isDeleted")}
+            )
+        duplicates = {title: entries for title, entries in by_title.items() if len(entries) > 1}
+        return {"total_jobs": len(all_jobs), "duplicate_titles": duplicates}
 
     result = await asyncio.to_thread(_run)
     return JSONResponse(result)
