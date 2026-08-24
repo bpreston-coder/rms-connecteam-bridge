@@ -31,6 +31,10 @@ It also finds a Connecteam Job per Service line item (matched by service
 name, never created here), writes the Current RMS order number into the
 shift's "Job No." custom field, and the required headcount into "Qty Rqrd".
 
+Each shift's notes include a "Site contact" line — the opportunity's
+"on-site contact if different from project contact" custom field when set,
+otherwise the opportunity owner's name.
+
 See README.md for setup instructions.
 """
 
@@ -256,6 +260,22 @@ def fetch_venue_address(client: httpx.Client, opportunity: dict[str, Any]) -> st
         addr.get("country_name"),
     ]
     return ", ".join(p for p in parts if p)
+
+
+def fetch_member_name(client: httpx.Client, member_id: int | None) -> str | None:
+    """Return a Member's display name — used to resolve an opportunity's
+    owner (opportunity["owned_by"] is a member_id) to a human name for the
+    site-contact default. None if member_id is falsy or not found."""
+    if not member_id:
+        return None
+    resp = client.get(
+        f"{CURRENT_RMS_BASE_URL}/api/v1/members/{member_id}",
+        headers=rms_headers(),
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()["member"].get("name")
 
 
 def fetch_service_items(client: httpx.Client, opportunity_id: int) -> list[dict[str, Any]]:
@@ -536,6 +556,18 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
 
     address = fetch_venue_address(client, opportunity)
     order_number = opportunity.get("number")
+
+    # Site contact: defaults to the opportunity owner's name, overridden by
+    # the "on-site contact if different" custom field when it's filled in.
+    # Computed once per opportunity (not per service item) — it's the same
+    # for every shift on this order. Confirmed with the user 2026-08-19.
+    site_contact_override = (
+        (opportunity.get("custom_fields") or {})
+        .get("on-site_contact_if_different_from_project_contact", "")
+        or ""
+    ).strip()
+    site_contact = site_contact_override or fetch_member_name(client, opportunity.get("owned_by")) or ""
+
     job_title_cache: dict[str, Any] = state["job_title_cache"]
 
     # Refresh the whole Job title/color cache once per sync. The cache used
@@ -623,6 +655,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             "address": address,
             "quantity": quantity,
             "description": description,
+            "siteContact": site_contact,
         }
 
         custom_fields = []
@@ -637,15 +670,14 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             {"customFieldId": CONNECTEAM_SHIFT_TYPE_CUSTOM_FIELD_ID, "value": description}
         )
 
-        notes = [
-            {
-                "html": (
-                    f"<p>Auto-created from Current RMS order "
-                    f"{opportunity.get('number', opportunity['id'])} "
-                    f"(opportunity item #{service['id']}).</p>"
-                )
-            }
-        ]
+        notes_html = (
+            f"<p>Auto-created from Current RMS order "
+            f"{opportunity.get('number', opportunity['id'])} "
+            f"(opportunity item #{service['id']}).</p>"
+        )
+        if site_contact:
+            notes_html += f"<p>Site contact: {site_contact}</p>"
+        notes = [{"html": notes_html}]
 
         existing = shifts_state.get(key)
         if existing is not None:
@@ -691,6 +723,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             or existing.get("address") != address
             or existing.get("quantity") != quantity
             or existing.get("description") != description
+            or existing.get("siteContact") != site_contact
         ):
             update_payload: dict[str, Any] = {
                 "shiftId": existing["shiftId"],
