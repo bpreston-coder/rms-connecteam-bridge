@@ -23,6 +23,11 @@ Current RMS opportunity_item's ID:
   - If the opportunity is no longer eligible (flag unticked, or it went
     dead/lost/reverted) -> DELETE any shifts we created that are still
     draft; leave already-published shifts alone for manual review.
+  - Whenever a published shift is left in place instead of deleted, or
+    gets edited in place because Current RMS changed under it, ops is
+    notified in Google Chat (see notify_ops / GOOGLE_CHAT_WEBHOOK_URL) so
+    a human knows to check on a shift crew may already have been told
+    about.
 This guarantees we never create duplicate shifts, no matter how many times
 an opportunity is processed (webhook retries, overlapping polls, re-
 conversions), and never silently blow away a shift someone has published.
@@ -112,6 +117,19 @@ CONNECTEAM_SHIFT_TYPE_CUSTOM_FIELD_ID = int(
 # webhook endpoint — it's also required for /sync so randoms can't trigger
 # an unscheduled full sync. Keep the URL itself private too.
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
+
+# Incoming webhook URL for the ops Google Chat space. Posted to whenever a
+# shift a human already published gets left in place during cleanup or
+# edited by the sync — both cases where a real person may have already told
+# crew about that shift. Unset by default: notify_ops() just logs and
+# no-ops rather than failing sync, so this is safe to leave unconfigured in
+# test.
+GOOGLE_CHAT_WEBHOOK_URL = os.environ.get("GOOGLE_CHAT_WEBHOOK_URL", "")
+
+# Perth (AWST) is fixed UTC+8 year-round — no DST to account for. Used only
+# to render times in ops-facing Chat notifications in local time rather
+# than UTC.
+PERTH_TZ = timezone(timedelta(hours=8))
 
 # Where we remember: (a) which Connecteam shift belongs to which Current RMS
 # opportunity_item (so we UPDATE instead of duplicating), and (b) how far
@@ -486,6 +504,27 @@ def delete_shift(client: httpx.Client, shift_id: str) -> None:
         resp.raise_for_status()
 
 
+def notify_ops(client: httpx.Client, text: str) -> None:
+    """Post a message to the ops Google Chat space. Best-effort: logs and
+    swallows failures instead of raising, so a Chat outage never breaks a
+    sync that otherwise succeeded."""
+    if not GOOGLE_CHAT_WEBHOOK_URL:
+        log.warning("GOOGLE_CHAT_WEBHOOK_URL not set — skipping ops notification: %s", text)
+        return
+    try:
+        resp = client.post(GOOGLE_CHAT_WEBHOOK_URL, json={"text": text})
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        log.exception("Failed to post ops notification to Google Chat: %s", text)
+
+
+def _format_epoch(ts: int) -> str:
+    """Used in ops-facing Chat notifications only — local (Perth) time, not
+    UTC, since that's what the times actually mean to crew reading the
+    message."""
+    return datetime.fromtimestamp(ts, tz=PERTH_TZ).strftime("%a %d %b %Y, %H:%M AWST")
+
+
 def cleanup_ineligible_opportunity(
     client: httpx.Client, opportunity_id: int, reason: str, state: dict[str, Any]
 ) -> dict[str, Any]:
@@ -494,16 +533,20 @@ def cleanup_ineligible_opportunity(
     Draft (unpublished) shifts we created for it are deleted automatically.
     Published shifts are left alone — a human has already put real
     scheduling work into a published shift, so this only deletes what's
-    still safely a draft. (Notifying ops about left-behind published shifts
-    is planned but not wired up yet.)"""
+    still safely a draft. Ops is notified about any left-behind published
+    shift, batched into ONE Chat message for this whole cleanup call rather
+    than one per shift."""
     shifts_state: dict[str, Any] = state["shifts"]
     keys = [k for k, v in shifts_state.items() if v.get("opportunityId") == opportunity_id]
     if not keys:
         return {"status": "skipped", "reason": reason, "tracked_shifts": 0}
 
+    job_id_to_title = {v: k for k, v in state["job_title_cache"].get("by_title", {}).items()}
+
     deleted = 0
-    left_published = 0
     already_gone = 0
+    left_published_blocks: list[str] = []
+    order_number = None
     for key in keys:
         shift_id = shifts_state[key]["shiftId"]
         shift = get_shift(client, shift_id)
@@ -512,23 +555,37 @@ def cleanup_ineligible_opportunity(
             del shifts_state[key]
             continue
         if shift.get("isPublished"):
-            left_published += 1
             log.warning(
                 "Opportunity %s is no longer eligible (%s) but shift %s is already published — "
                 "leaving it in place for manual review.",
                 opportunity_id, reason, shift_id,
             )
+            order_number = shifts_state[key].get("orderNumber") or order_number
+            title = shifts_state[key].get("title")
+            job_label = job_id_to_title.get(shifts_state[key].get("jobId"), "(no Job)")
+            left_published_blocks.append(f'"{title}" — {job_label} ({shift_id})')
             continue
         delete_shift(client, shift_id)
         deleted += 1
         del shifts_state[key]
+
+    if left_published_blocks:
+        shift_word = "shift needs" if len(left_published_blocks) == 1 else "shifts need"
+        notify_ops(
+            client,
+            f"⚠️ {len(left_published_blocks)} published Connecteam {shift_word} manual review.\n"
+            f"Opportunity {opportunity_id} (order {order_number}) — {reason}.\n"
+            + "\n".join(left_published_blocks)
+            + "\nAlready published, so the bridge left them in place instead of deleting. "
+            "Please review/cancel in Connecteam.",
+        )
 
     return {
         "status": "cleaned_up",
         "reason": reason,
         "tracked_shifts": len(keys),
         "deleted_draft_count": deleted,
-        "left_published_count": left_published,
+        "left_published_count": len(left_published_blocks),
         "already_gone_count": already_gone,
     }
 
@@ -809,10 +866,82 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             _rebuild_job_fields(payload, desired, key)
         updated_shifts = update_shifts(client, [p for _, p, _ in to_update])
 
+    # Snapshot pre-update state before it's overwritten below, so the
+    # published-edit notification can describe exactly what changed.
+    previous_by_key = {key: dict(shifts_state.get(key, {})) for key, _, _ in to_update}
+
     for key, _, desired in to_update:
         existing = shifts_state.get(key, {})
         existing.update(desired)
         shifts_state[key] = existing
+
+    # A shift someone already published can still be in to_update (nothing
+    # here checks publish state before editing — Current RMS changes are
+    # still pushed through). Ops gets a heads-up, with specifics, so crew
+    # who were told about the original time/details aren't caught out by a
+    # silent change. Batched into ONE Chat message for this whole sync call
+    # rather than one per shift.
+    job_id_to_title = {v: k for k, v in job_title_cache.get("by_title", {}).items()}
+
+    def _job_label(job_id: str | None) -> str:
+        if not job_id:
+            return "(none)"
+        return job_id_to_title.get(job_id, job_id)
+
+    published_edit_blocks: list[str] = []
+    for (key, _, desired), shift_obj in zip(to_update, updated_shifts):
+        if shift_obj.get("isPublished"):
+            previous = previous_by_key.get(key, {})
+            changes: list[str] = []
+            if previous.get("jobId") != desired.get("jobId"):
+                changes.append(
+                    f"Job — Original: {_job_label(previous.get('jobId'))}, "
+                    f"Updated to: {_job_label(desired.get('jobId'))}"
+                )
+            if previous.get("startTime") != desired.get("startTime") or previous.get("endTime") != desired.get(
+                "endTime"
+            ):
+                changes.append(
+                    f"Time — Original: {_format_epoch(previous['startTime'])} – {_format_epoch(previous['endTime'])}, "
+                    f"Updated to: {_format_epoch(desired['startTime'])} – {_format_epoch(desired['endTime'])}"
+                )
+            if previous.get("title") != desired.get("title"):
+                changes.append(
+                    f'Title — Original: "{previous.get("title")}", Updated to: "{desired.get("title")}"'
+                )
+            if previous.get("quantity") != desired.get("quantity"):
+                changes.append(
+                    f"Quantity required — Original: {previous.get('quantity')}, Updated to: {desired.get('quantity')}"
+                )
+            if previous.get("address") != desired.get("address"):
+                changes.append(
+                    f"Address — Original: {previous.get('address')}, Updated to: {desired.get('address')}"
+                )
+            if previous.get("description") != desired.get("description"):
+                changes.append(
+                    f'Notes — Original: "{previous.get("description")}", '
+                    f'Updated to: "{desired.get("description")}"'
+                )
+            if previous.get("siteContact") != desired.get("siteContact"):
+                changes.append(
+                    f'Site contact — Original: "{previous.get("siteContact")}", '
+                    f'Updated to: "{desired.get("siteContact")}"'
+                )
+            change_text = "\n".join(f"  • {c}" for c in changes) if changes else "  (no tracked-field change detected)"
+            published_edit_blocks.append(
+                f"Shift \"{desired.get('title')}\" — {_job_label(desired.get('jobId'))} "
+                f"({shift_obj['id']}):\n{change_text}"
+            )
+
+    if published_edit_blocks:
+        shift_word = "shift" if len(published_edit_blocks) == 1 else "shifts"
+        notify_ops(
+            client,
+            f"✏️ {len(published_edit_blocks)} published Connecteam {shift_word} edited by sync.\n"
+            f"{subject} — Order {order_number} (Opportunity {opportunity_id}):\n\n"
+            + "\n\n".join(published_edit_blocks)
+            + "\n\nPlease confirm crew are aware of the change.",
+        )
 
     return {
         "status": "ok",
