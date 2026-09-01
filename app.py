@@ -583,17 +583,57 @@ def delete_shift(client: httpx.Client, shift_id: str) -> None:
 
 
 def notify_ops(client: httpx.Client, text: str) -> None:
-    """Post a message to the ops Google Chat space. Best-effort: logs and
-    swallows failures instead of raising, so a Chat outage never breaks a
-    sync that otherwise succeeded."""
+    """Post a message to the ops Google Chat space, as a Card TextParagraph
+    rather than a plain text message — Chat's plain `text` field supports
+    no color, only a card's TextParagraph does
+    (<font color="#RRGGBB">...</font>, confirmed via Google's card
+    text-formatting docs). `text` may use \\n for line breaks (converted to
+    <br> here) and inline HTML tags — see _orange()/_green() for the
+    colored Original/Updated diff wording. Best-effort: logs and swallows
+    failures instead of raising, so a Chat outage never breaks a sync that
+    otherwise succeeded."""
     if not GOOGLE_CHAT_WEBHOOK_URL:
         log.warning("GOOGLE_CHAT_WEBHOOK_URL not set — skipping ops notification: %s", text)
         return
+    payload = {
+        "cardsV2": [
+            {
+                "cardId": "bridge-notification",
+                "card": {
+                    "sections": [{"widgets": [{"textParagraph": {"text": text.replace("\n", "<br>")}}]}]
+                },
+            }
+        ]
+    }
     try:
-        resp = client.post(GOOGLE_CHAT_WEBHOOK_URL, json={"text": text})
+        resp = client.post(GOOGLE_CHAT_WEBHOOK_URL, json=payload)
         resp.raise_for_status()
     except httpx.HTTPError:
         log.exception("Failed to post ops notification to Google Chat: %s", text)
+
+
+def _html_escape(value: Any) -> str:
+    """Escape a value for safe inclusion inside a Card TextParagraph's
+    HTML — used only for the free-text values wrapped in a colored <font>
+    span by _orange()/_green(), since those can contain arbitrary
+    Current RMS-entered text (notes, addresses, etc)."""
+    text = "" if value is None else str(value)
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# Colors for the "Original: X, Updated to: Y" wording in the
+# published-shift-edited Chat notification — orange for what it was, green
+# for what it's now. Confirmed with the user 2026-08-27.
+_ORIGINAL_COLOR = "#E69138"
+_UPDATED_COLOR = "#38761D"
+
+
+def _orange(value: Any) -> str:
+    return f'<font color="{_ORIGINAL_COLOR}">{_html_escape(value)}</font>'
+
+
+def _green(value: Any) -> str:
+    return f'<font color="{_UPDATED_COLOR}">{_html_escape(value)}</font>'
 
 
 def _format_epoch(ts: int) -> str:
@@ -1118,37 +1158,41 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             changes: list[str] = []
             if previous.get("jobId") != desired.get("jobId"):
                 changes.append(
-                    f"Job — Original: {_job_label(previous.get('jobId'))}, "
-                    f"Updated to: {_job_label(desired.get('jobId'))}"
+                    f"Job — Original: {_orange(_job_label(previous.get('jobId')))}, "
+                    f"Updated to: {_green(_job_label(desired.get('jobId')))}"
                 )
             if previous.get("startTime") != desired.get("startTime") or previous.get("endTime") != desired.get(
                 "endTime"
             ):
+                previous_time = _format_epoch(previous["startTime"]) + " – " + _format_epoch(previous["endTime"])
+                desired_time = _format_epoch(desired["startTime"]) + " – " + _format_epoch(desired["endTime"])
                 changes.append(
-                    f"Time — Original: {_format_epoch(previous['startTime'])} – {_format_epoch(previous['endTime'])}, "
-                    f"Updated to: {_format_epoch(desired['startTime'])} – {_format_epoch(desired['endTime'])}"
+                    f"Time — Original: {_orange(previous_time)}, Updated to: {_green(desired_time)}"
                 )
             if previous.get("title") != desired.get("title"):
                 changes.append(
-                    f'Title — Original: "{previous.get("title")}", Updated to: "{desired.get("title")}"'
+                    f'Title — Original: "{_orange(previous.get("title"))}", '
+                    f'Updated to: "{_green(desired.get("title"))}"'
                 )
             if previous.get("quantity") != desired.get("quantity"):
                 changes.append(
-                    f"Quantity required — Original: {previous.get('quantity')}, Updated to: {desired.get('quantity')}"
+                    f"Quantity required — Original: {_orange(previous.get('quantity'))}, "
+                    f"Updated to: {_green(desired.get('quantity'))}"
                 )
             if previous.get("address") != desired.get("address"):
                 changes.append(
-                    f"Address — Original: {previous.get('address')}, Updated to: {desired.get('address')}"
+                    f"Address — Original: {_orange(previous.get('address'))}, "
+                    f"Updated to: {_green(desired.get('address'))}"
                 )
             if previous.get("description") != desired.get("description"):
                 changes.append(
-                    f'Notes — Original: "{previous.get("description")}", '
-                    f'Updated to: "{desired.get("description")}"'
+                    f'Notes — Original: "{_orange(previous.get("description"))}", '
+                    f'Updated to: "{_green(desired.get("description"))}"'
                 )
             if previous.get("siteContact") != desired.get("siteContact"):
                 changes.append(
-                    f'Site contact — Original: "{previous.get("siteContact")}", '
-                    f'Updated to: "{desired.get("siteContact")}"'
+                    f'Site contact — Original: "{_orange(previous.get("siteContact"))}", '
+                    f'Updated to: "{_green(desired.get("siteContact"))}"'
                 )
             change_text = "\n".join(f"  • {c}" for c in changes) if changes else "  (no tracked-field change detected)"
             published_edit_blocks.append(
