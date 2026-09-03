@@ -3,7 +3,10 @@ Current RMS -> Connecteam draft shift bridge.
 
 An opportunity is eligible for draft shifts when it's in "Order" state
 (always), or in "Quotation" state with the "Draft shifts in Connecteam"
-Yes/No custom field ticked. Two paths keep Connecteam in sync:
+Yes/No custom field ticked — UNLESS it's been marked dead or lost, which
+Current RMS represents as a status_name change ("Dead"/"Lost"), not a state
+change or flag change, so it's checked first regardless of state/flag (see
+DEAD_OR_LOST_STATUS_NAMES). Two paths keep Connecteam in sync:
 
   1. Webhooks fire instantly on opportunity_convert_to_order, opportunity_
      update, opportunity_convert_to_quotation, opportunity_revert_to_
@@ -308,12 +311,30 @@ def fetch_opportunities_updated_since(client: httpx.Client, since_iso: str) -> l
     return list(ids)
 
 
+#  Current RMS represents "marked as dead/lost" as a `status`/`status_name`
+#  change (e.g. status_name == "Dead"), NOT a `state` change — an opportunity
+#  marked dead stays in whatever state it was in (state_name still
+#  "Quotation" or "Order"), and any "Draft shifts in Connecteam" flag is left
+#  as-is too. Confirmed live against opportunity 4056 (marked dead 2026-09-
+#  02): state_name stayed "Quotation", draft_shifts_in_connecteams stayed
+#  "Yes", only status_name changed to "Dead" — so eligibility must check
+#  status_name first or a dead/lost opportunity is wrongly treated as still
+#  eligible and its shifts are never cleaned up.
+DEAD_OR_LOST_STATUS_NAMES = {"Dead", "Lost"}
+
+
 def _is_eligible(opportunity: dict[str, Any]) -> tuple[bool, str]:
-    """Order state is always eligible (existing behavior). Quotation state is
-    eligible only when the "Draft shifts in Connecteam" Yes/No custom field
-    is ticked — Current RMS returns this as custom_fields.
-    draft_shifts_in_connecteams == "Yes" (exact string, confirmed live).
-    Everything else (Enquiry, dead, lost, etc.) is not eligible."""
+    """An opportunity marked dead or lost (status_name, not state_name) is
+    never eligible, regardless of state or flag. Otherwise: Order state is
+    always eligible (existing behavior). Quotation state is eligible only
+    when the "Draft shifts in Connecteam" Yes/No custom field is ticked —
+    Current RMS returns this as custom_fields.draft_shifts_in_connecteams ==
+    "Yes" (exact string, confirmed live). Everything else (Enquiry, Draft,
+    etc.) is not eligible."""
+    status_name = opportunity.get("status_name")
+    if status_name in DEAD_OR_LOST_STATUS_NAMES:
+        return False, f"status '{status_name}'"
+
     state_name = opportunity.get("state_name")
     if state_name == "Order":
         return True, "order"
