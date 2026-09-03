@@ -1353,6 +1353,46 @@ async def manual_sync(token: str | None = None):
     return JSONResponse(result)
 
 
+@app.get("/debug/sweep-dead-lost")
+async def sweep_dead_lost(token: str | None = None):
+    """One-off sweep: check every opportunity with tracked shifts against
+    Current RMS, and clean up any that are now Dead/Lost — covers
+    opportunities that went dead/lost before the status_name eligibility
+    check existed. Temporary; safe to remove once run."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        with sync_lock:
+            state = _load_state()
+            shifts_state: dict[str, Any] = state["shifts"]
+            opportunity_ids = sorted({v["opportunityId"] for v in shifts_state.values()})
+
+            cleaned: dict[str, Any] = {}
+            with httpx.Client(timeout=30) as client:
+                for opportunity_id in opportunity_ids:
+                    try:
+                        opportunity = fetch_opportunity(client, opportunity_id)
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code == 404:
+                            cleaned[str(opportunity_id)] = cleanup_ineligible_opportunity(
+                                client, opportunity_id, "deleted", state
+                            )
+                        else:
+                            cleaned[str(opportunity_id)] = {"status": "error", "detail": str(exc)}
+                        continue
+                    status_name = opportunity.get("status_name")
+                    if status_name in DEAD_OR_LOST_STATUS_NAMES:
+                        cleaned[str(opportunity_id)] = cleanup_ineligible_opportunity(
+                            client, opportunity_id, f"status '{status_name}'", state
+                        )
+            _save_state(state)
+            return {"opportunities_checked": len(opportunity_ids), "cleaned_up": cleaned}
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
