@@ -1353,6 +1353,45 @@ async def manual_sync(token: str | None = None):
     return JSONResponse(result)
 
 
+@app.get("/debug/dump-shifts")
+async def debug_dump_shifts(ids: str, token: str | None = None):
+    """Temporary: dump raw Connecteam shift objects for the given comma-
+    separated shift IDs, to diagnose the multi-assignee split-on-update
+    report. Safe to remove once diagnosed."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> dict[str, Any]:
+        with httpx.Client(timeout=30) as client:
+            return {shift_id: get_shift(client, shift_id) for shift_id in ids.split(",")}
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
+@app.get("/debug/list-shifts-in-range")
+async def debug_list_shifts_in_range(start: int, end: int, token: str | None = None):
+    """Temporary: list every Connecteam shift overlapping [start, end)
+    (epoch seconds), to find sibling shifts not tracked in our state.
+    Safe to remove once diagnosed."""
+    if WEBHOOK_TOKEN and not hmac.compare_digest(token or "", WEBHOOK_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+
+    def _run() -> list[dict[str, Any]]:
+        headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+        with httpx.Client(timeout=30) as client:
+            resp = client.get(
+                f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+                headers=headers,
+                params={"startTime": start, "endTime": end, "limit": 500},
+            )
+            resp.raise_for_status()
+            return resp.json().get("data", {}).get("shifts", [])
+
+    result = await asyncio.to_thread(_run)
+    return JSONResponse(result)
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
