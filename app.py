@@ -120,7 +120,15 @@ CONNECTEAM_JOBNO_CUSTOM_FIELD_ID = int(os.environ.get("CONNECTEAM_JOBNO_CUSTOM_F
 # with HTTP 200 but never actually changes the stored openSpots when
 # created or updated through the public API — only the internal,
 # session-authenticated web app can do that). So admins read this field and
-# manually assign that many people to the single shift.
+# manually assign that many people — but manually assigning a 2nd/3rd
+# person does NOT add them to that one shift's assignedUserIds; Connecteam
+# forks a whole separate shift record per extra assignee (same Job/title/
+# custom fields, same original time). Confirmed live 2026-09-07 against
+# order 100004013's "Set up" item (Qty Rqrd 2): a time edit only reached
+# the originally-created shiftId, leaving the second assignee's forked
+# shift at the old time. sync_opportunity's per-item loop now searches for
+# and updates these forks too — see _find_sibling_shift_ids — and a
+# tracked item's state entry holds a "shiftIds" list rather than one id.
 CONNECTEAM_QTY_CUSTOM_FIELD_ID = int(os.environ.get("CONNECTEAM_QTY_CUSTOM_FIELD_ID", "1319220"))
 
 # Shift custom field id for "Shift Type/Notes" — holds the Current RMS
@@ -243,6 +251,15 @@ def _load_state() -> dict[str, Any]:
             data.setdefault("jobs", {})  # legacy per-order job cache, unused by current code
             data.setdefault("job_title_cache", {})
             data.setdefault("poll_cursor", None)
+            # Migrate legacy single-"shiftId" entries to a "shiftIds" list —
+            # a tracked item can now correspond to more than one live
+            # Connecteam shift (see _find_sibling_shift_ids: Connecteam
+            # forks a whole new shift record, rather than adding to
+            # assignedUserIds, when a 2nd/3rd person is manually assigned to
+            # a Qty Rqrd > 1 shift).
+            for entry in data["shifts"].values():
+                if "shiftId" in entry:
+                    entry["shiftIds"] = [entry.pop("shiftId")]
             return data
         except (json.JSONDecodeError, OSError):
             log.warning("Could not read state file %s, starting fresh", STATE_FILE)
@@ -577,6 +594,51 @@ def update_shifts(client: httpx.Client, payloads: list[dict[str, Any]]) -> list[
     return updated
 
 
+def _find_sibling_shift_ids(
+    client: httpx.Client,
+    order_number: str | int | None,
+    shift_type: str,
+    job_id: str | None,
+    start: int,
+    end: int,
+) -> list[str]:
+    """Find every live Connecteam shift matching the same order ("Job No."
+    custom field), Shift Type/Notes, and Job (task type), sitting at the
+    given time — used to catch shifts Connecteam silently forks when a
+    2nd/3rd person is manually assigned to a Qty Rqrd > 1 shift. Confirmed
+    live 2026-09-07 (order 100004013, "Set up" item, Qty Rqrd 2): assigning
+    a second person does NOT add them to the original shift's
+    assignedUserIds — Connecteam clones an entirely separate shift record,
+    same Job/title/custom fields, at the same original time. Since the
+    public Shifts API has no working multi-assignee field (see
+    CONNECTEAM_QTY_CUSTOM_FIELD_ID), this clone is the only way multiple
+    people end up "on" one Qty Rqrd item, so every sync for such an item
+    must find and update every clone, not just the one we created. Callers
+    should search using the shift's current LIVE time (before this sync's
+    update is applied), since a not-yet-discovered clone still sits at that
+    original time. Small time padding covers any off-by-a-few-seconds
+    rounding; Job/order/type equality is what actually disambiguates."""
+    if not order_number:
+        return []
+    headers = {"X-API-KEY": CONNECTEAM_API_KEY}
+    resp = client.get(
+        f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+        headers=headers,
+        params={"startTime": start - 300, "endTime": end + 300, "limit": 500},
+    )
+    resp.raise_for_status()
+    matches = []
+    for shift in resp.json().get("data", {}).get("shifts", []):
+        if shift.get("jobId") != job_id:
+            continue
+        custom = {c.get("name"): c.get("value") for c in shift.get("customFields", [])}
+        if custom.get("Job No.") == str(order_number) and custom.get("Shift Type/Notes", "") == (
+            shift_type or ""
+        ):
+            matches.append(shift["id"])
+    return matches
+
+
 def get_shift(client: httpx.Client, shift_id: str) -> dict[str, Any] | None:
     """Fetch a single shift; returns None if it no longer exists (e.g.
     already deleted by hand in Connecteam)."""
@@ -799,20 +861,23 @@ def _cleanup_shift_keys(
     already_gone = 0
     deleted_published_blocks: list[str] = []
     order_number = None
+    tracked_shift_count = 0
     for key in keys:
-        shift_id = shifts_state[key]["shiftId"]
-        shift = get_shift(client, shift_id)
-        if shift is None:
-            already_gone += 1
-            del shifts_state[key]
-            continue
-        if shift.get("isPublished"):
-            order_number = shifts_state[key].get("orderNumber") or order_number
-            title = shifts_state[key].get("title")
-            job_label = job_id_to_title.get(shifts_state[key].get("jobId"), "(no Job)")
-            deleted_published_blocks.append(f'"{title}" — {job_label} ({shift_id})')
-        delete_shift(client, shift_id)
-        deleted += 1
+        entry = shifts_state[key]
+        shift_ids = entry.get("shiftIds") or ([entry["shiftId"]] if "shiftId" in entry else [])
+        tracked_shift_count += len(shift_ids)
+        for shift_id in shift_ids:
+            shift = get_shift(client, shift_id)
+            if shift is None:
+                already_gone += 1
+                continue
+            if shift.get("isPublished"):
+                order_number = entry.get("orderNumber") or order_number
+                title = entry.get("title")
+                job_label = job_id_to_title.get(entry.get("jobId"), "(no Job)")
+                deleted_published_blocks.append(f'"{title}" — {job_label} ({shift_id})')
+            delete_shift(client, shift_id)
+            deleted += 1
         del shifts_state[key]
 
     if deleted_published_blocks:
@@ -825,7 +890,7 @@ def _cleanup_shift_keys(
         )
 
     return {
-        "tracked_shifts": len(keys),
+        "tracked_shifts": tracked_shift_count,
         "deleted_count": deleted,
         "deleted_published_count": len(deleted_published_blocks),
         "already_gone_count": already_gone,
@@ -1020,23 +1085,61 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         notes = [{"html": notes_html}]
 
         existing = shifts_state.get(key)
+        force_sync_siblings = False
         if existing is not None:
-            # Verify the tracked shift still exists before trusting it for
+            # Verify every tracked shift still exists before trusting it for
             # a diff — a human can delete a shift directly in Connecteam,
             # and without this check the app would keep believing it's
             # still there (comparing against tracked state only, never
             # Connecteam) and silently never recreate it. Confirmed live
             # via /debug/inspect-sync: one shift on order #4012 had been
             # deleted this way and stayed missing indefinitely.
-            live_shift = get_shift(client, existing["shiftId"])
-            if live_shift is None:
-                log.warning(
-                    "Tracked shift %s for opportunity %s (service item %s) no longer "
-                    "exists in Connecteam — recreating it.",
-                    existing["shiftId"], opportunity_id, key,
-                )
+            tracked_ids = existing.get("shiftIds") or ([existing["shiftId"]] if "shiftId" in existing else [])
+            live_ids: list[str] = []
+            primary_live_shift = None
+            for shift_id in tracked_ids:
+                live_shift = get_shift(client, shift_id)
+                if live_shift is None:
+                    log.warning(
+                        "Tracked shift %s for opportunity %s (service item %s) no longer "
+                        "exists in Connecteam — dropping it.",
+                        shift_id, opportunity_id, key,
+                    )
+                    continue
+                live_ids.append(shift_id)
+                if primary_live_shift is None:
+                    primary_live_shift = live_shift
+
+            # Qty Rqrd > 1 items: Connecteam forks a whole new shift record
+            # (rather than adding to assignedUserIds) when a 2nd/3rd person
+            # is manually assigned — see _find_sibling_shift_ids. Search
+            # using the shift's still-live (pre-update) time so a
+            # not-yet-tracked fork sitting at that time is found before this
+            # sync's update is applied.
+            if quantity > 1 and primary_live_shift is not None:
+                for sibling_id in _find_sibling_shift_ids(
+                    client,
+                    order_number,
+                    description,
+                    job_id,
+                    primary_live_shift["startTime"],
+                    primary_live_shift["endTime"],
+                ):
+                    if sibling_id not in live_ids:
+                        live_ids.append(sibling_id)
+                        force_sync_siblings = True
+                        log.info(
+                            "Discovered Connecteam-forked sibling shift %s for opportunity %s "
+                            "item %s (Qty Rqrd %s) — bringing it in sync with %s",
+                            sibling_id, opportunity_id, key, quantity, tracked_ids,
+                        )
+
+            if not live_ids:
                 del shifts_state[key]
                 existing = None
+            else:
+                existing = {**existing, "shiftIds": live_ids}
+                shifts_state[key] = existing
         if existing is None:
             payload: dict[str, Any] = {
                 "startTime": start,
@@ -1064,22 +1167,27 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             or existing.get("quantity") != quantity
             or existing.get("description") != description
             or existing.get("siteContact") != site_contact
+            or force_sync_siblings
         ):
-            update_payload: dict[str, Any] = {
-                "shiftId": existing["shiftId"],
-                "startTime": start,
-                "endTime": end,
-                "title": title,
-                "notes": notes,
-                "customFields": custom_fields,
-            }
-            if job_id:
-                update_payload["jobId"] = job_id
-            if job_color:
-                update_payload["color"] = job_color
-            if address:
-                update_payload["locationData"] = {"isReferencedToJob": False, "gps": {"address": address}}
-            to_update.append((key, update_payload, desired))
+            # One payload per tracked shiftId — a Qty Rqrd > 1 item can have
+            # more than one live Connecteam shift (see the sibling-discovery
+            # block above), and every one of them needs the same update.
+            for shift_id in existing["shiftIds"]:
+                update_payload: dict[str, Any] = {
+                    "shiftId": shift_id,
+                    "startTime": start,
+                    "endTime": end,
+                    "title": title,
+                    "notes": notes,
+                    "customFields": custom_fields,
+                }
+                if job_id:
+                    update_payload["jobId"] = job_id
+                if job_color:
+                    update_payload["color"] = job_color
+                if address:
+                    update_payload["locationData"] = {"isReferencedToJob": False, "gps": {"address": address}}
+                to_update.append((key, update_payload, desired))
         else:
             unchanged += 1
 
@@ -1133,7 +1241,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             len(created_shifts), len(to_create), opportunity_id,
         )
     for (key, _, desired), shift_obj in zip(to_create, created_shifts):
-        shifts_state[key] = {"shiftId": shift_obj["id"], **desired}
+        shifts_state[key] = {"shiftIds": [shift_obj["id"]], **desired}
 
     try:
         updated_shifts = update_shifts(client, [p for _, p, _ in to_update])
