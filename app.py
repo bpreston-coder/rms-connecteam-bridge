@@ -41,9 +41,10 @@ item — see below):
   - A finalised/completed service line item (status_name == "Completed")
     is left completely untouched — no create, update, delete, or
     notification (see FINALISED_STATUS_NAME).
-  - Whenever a published shift is deleted, or gets edited in place because
-    Current RMS changed under it, ops is notified in Google Chat (see
-    notify_ops / GOOGLE_CHAT_WEBHOOK_URL) so a human knows a shift crew
+  - Operational edits/deletions of published shifts with work remaining
+    notify ops in Google Chat. Past shifts, completed service lines and
+    internal refreshes are silent. In-progress shifts retain alerts. See
+    notify_ops / GOOGLE_CHAT_WEBHOOK_URL so a human knows a shift crew
     may already have been told about was just removed or changed — after
     the fact, since by the time the message lands the action has already
     happened.
@@ -835,6 +836,26 @@ def _expand_service_segments(
     return expanded, skipped, protected_keys
 
 
+def _notification_work_remaining(*versions: dict[str, Any], now: float) -> bool:
+    """Notification-only date gate; sync must never use this predicate.
+
+    Use scheduled shift segments, not opportunity dates or Connecteam Job
+    dates (Jobs are task types). Check both versions so moving a future
+    shift into the past cannot hide its change. Retain in-progress alerts
+    pending an explicit operational decision about that boundary. Unknown
+    legacy dates retain alerts rather than silently hiding cancellations.
+    """
+    for version in versions:
+        if version.get("notificationFinalised") or version.get("notificationCancelled"):
+            continue
+        end = version.get("endTime")
+        if not isinstance(end, (int, float)) or isinstance(end, bool):
+            return True
+        if end > now:
+            return True
+    return False
+
+
 def _cleanup_shift_keys(
     client: httpx.Client,
     keys: list[str],
@@ -862,6 +883,8 @@ def _cleanup_shift_keys(
     deleted_published_blocks: list[str] = []
     order_number = None
     tracked_shift_count = 0
+    deleted_published_count = 0
+    notification_now = time.time()
     for key in keys:
         entry = shifts_state[key]
         shift_ids = entry.get("shiftIds") or ([entry["shiftId"]] if "shiftId" in entry else [])
@@ -872,6 +895,13 @@ def _cleanup_shift_keys(
                 already_gone += 1
                 continue
             if shift.get("isPublished"):
+                deleted_published_count += 1
+            if (
+                shift.get("isPublished")
+                and not entry.get("notificationFinalised")
+                and not entry.get("notificationCancelled")
+                and _notification_work_remaining(entry, shift, now=notification_now)
+            ):
                 order_number = entry.get("orderNumber") or order_number
                 title = entry.get("title")
                 job_label = job_id_to_title.get(entry.get("jobId"), "(no Job)")
@@ -892,7 +922,7 @@ def _cleanup_shift_keys(
     return {
         "tracked_shifts": tracked_shift_count,
         "deleted_count": deleted,
-        "deleted_published_count": len(deleted_published_blocks),
+        "deleted_published_count": deleted_published_count,
         "already_gone_count": already_gone,
     }
 
@@ -933,6 +963,21 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
 
     services = fetch_service_items(client, opportunity_id)
     shifts_state: dict[str, Any] = state["shifts"]
+
+    # Notification metadata only: remember completion even when a later
+    # whole-opportunity cancellation enters cleanup before fetching items.
+    # Include all tracked segment keys, including an old split layout.
+    opportunity_completed = opportunity.get("status_name") == FINALISED_STATUS_NAME
+    opportunity_cancelled = opportunity.get("status_name") == "Cancelled"
+    finalised_ids = {str(s["id"]) for s in services if opportunity_completed or s.get("status_name") == FINALISED_STATUS_NAME}
+    active_ids = {str(s["id"]) for s in services if s.get("status_name") not in {FINALISED_STATUS_NAME, "Cancelled"}}
+    for key, entry in shifts_state.items():
+        if entry.get("opportunityId") == opportunity_id:
+            item_id = key.split(":", 1)[0]
+            if item_id in finalised_ids:
+                entry["notificationFinalised"] = True
+            elif item_id in active_ids:
+                entry.pop("notificationFinalised", None)
 
     # A service line item that's tracked (we made a shift for it before) but
     # no longer shows up here — deleted from the opportunity, excluded, or
@@ -1012,6 +1057,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     # _is_stale_job_id_error below) can redo the title lookup after a forced
     # cache refresh without re-walking the Current RMS service items.
     service_name_by_key: dict[str, str] = {}
+    cancellation_candidates: list[tuple[dict[str, Any], dict[str, Any], list[str]]] = []
+    notification_cancelled_by_key: dict[str, bool] = {}
 
     for key, service, start, end in expanded_segments:
 
@@ -1085,6 +1132,10 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         notes = [{"html": notes_html}]
 
         existing = shifts_state.get(key)
+        previous_notification = dict(existing) if existing is not None else None
+        published_ids: list[str] = []
+        cancelled = opportunity_cancelled or service.get("status_name") == "Cancelled"
+        notification_cancelled_by_key[key] = cancelled
         force_sync_siblings = False
         if existing is not None:
             # Verify every tracked shift still exists before trusting it for
@@ -1107,6 +1158,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
                     )
                     continue
                 live_ids.append(shift_id)
+                if live_shift.get("isPublished"):
+                    published_ids.append(shift_id)
                 if primary_live_shift is None:
                     primary_live_shift = live_shift
 
@@ -1140,6 +1193,11 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             else:
                 existing = {**existing, "shiftIds": live_ids}
                 shifts_state[key] = existing
+        # A Cancelled status does not currently remove shifts in the sync
+        # contract. Alert on the transition independently of field edits,
+        # without claiming the Connecteam shift was deleted.
+        if cancelled and previous_notification and not previous_notification.get("notificationCancelled"):
+            cancellation_candidates.append((previous_notification, desired, published_ids))
         if existing is None:
             payload: dict[str, Any] = {
                 "startTime": start,
@@ -1281,9 +1339,18 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         return job_id_to_title.get(job_id, job_id)
 
     published_edit_blocks: list[str] = []
-    for (key, _, desired), shift_obj in zip(to_update, updated_shifts):
-        if shift_obj.get("isPublished"):
-            previous = previous_by_key.get(key, {})
+    notification_now = time.time()
+    # Match responses by identity, not response order, for alert formatting.
+    updated_by_id = {str(shift["id"]): shift for shift in updated_shifts}
+    for key, payload, desired in to_update:
+        shift_obj = updated_by_id.get(str(payload["shiftId"]), {})
+        previous = previous_by_key.get(key, {})
+        if (
+            shift_obj.get("isPublished")
+            and not opportunity_completed
+            and not notification_cancelled_by_key.get(key)
+            and _notification_work_remaining(previous, desired, now=notification_now)
+        ):
             changes: list[str] = []
             if previous.get("jobId") != desired.get("jobId"):
                 changes.append(
@@ -1323,11 +1390,32 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
                     f'Site contact — Original: "{_orange(previous.get("siteContact"))}", '
                     f'Updated to: "{_green(desired.get("siteContact"))}"'
                 )
-            change_text = "\n".join(f"  • {c}" for c in changes) if changes else "  (no tracked-field change detected)"
+            # Color refreshes, sibling discovery and bookkeeping-only
+            # updates still sync but do not require crew action.
+            if not changes:
+                continue
+            change_text = "\n".join(f"  • {c}" for c in changes)
             published_edit_blocks.append(
                 f"Shift \"{desired.get('title')}\" — {_job_label(desired.get('jobId'))} "
                 f"({shift_obj['id']}):\n{change_text}"
             )
+
+    cancellation_blocks: list[str] = []
+    for previous, desired, published_ids in cancellation_candidates:
+        if not opportunity_completed and not previous.get("notificationFinalised") and _notification_work_remaining(previous, now=notification_now):
+            for shift_id in published_ids:
+                cancellation_blocks.append(f'"{desired.get("title")}" — {_job_label(desired.get("jobId"))} ({shift_id})')
+    if cancellation_blocks:
+        notify_ops(
+            client,
+            f"⚠️ OnRent work cancelled — Order {order_number} (Opportunity {opportunity_id}).\n"
+            + "\n".join(cancellation_blocks)
+            + "\nPlease review the published Connecteam shifts and confirm crew are aware.",
+        )
+    # Notification history only; never include it in the sync field diff.
+    for key, cancelled in notification_cancelled_by_key.items():
+        if key in shifts_state:
+            shifts_state[key]["notificationCancelled"] = cancelled
 
     if published_edit_blocks:
         shift_word = "shift" if len(published_edit_blocks) == 1 else "shifts"

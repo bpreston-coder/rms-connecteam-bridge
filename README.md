@@ -172,3 +172,31 @@ If nothing arrives, check:
   local disk. A full redeploy wipes it, so the next sync after a redeploy may re-create shifts
   it previously matched (it will fall back to Connecteam's own dedup where possible, e.g.
   jobs are matched by Job No. even after a state reset, but shift-level matching is lost).
+
+
+## Google Chat change alerts (October 2026)
+
+Chat reports operational changes to published shifts with scheduled work remaining:
+changes to task, time, title, quantity, address, notes or site contact; removal of
+previously active work; and an OnRent opportunity/service transition to `Cancelled`.
+The latter asks ops to review Connecteam rather than claiming the shift was deleted:
+this notification update does not alter the existing synchronization rules.
+
+Completed opportunities/service lines, shifts whose old and new schedules have ended,
+unchanged values, color-only refreshes and sibling/bookkeeping-only updates are silent.
+Cancellation uses the prior active tracked state, so the new inactive status does not
+hide a relevant alert. Completed/cancelled notification history is stored alongside
+shift tracking. Legacy tracked entries are treated as previously active until observed.
+
+Timing uses the existing epoch-second shift segments (including Perth daily splitting),
+not an opportunity-wide date or the Connecteam Job, which represents a task type.
+Both old and new edit times are considered. Mixed jobs are filtered per shift.
+In-progress shifts and legacy entries with unknown dates retain alerts pending an
+explicit decision to suppress those cases. Nothing here changes crew publication,
+assignment, API failure handling, or the actual shift create/update/delete behavior.
+
+Offline regression tests (no live credentials or messages):
+
+```bash
+python -m unittest discover -s tests -v
+```
