@@ -73,6 +73,11 @@ import logging
 import os
 import threading
 import time
+import re
+import uuid
+import html
+from contextlib import contextmanager
+from bridge_safety import RecoveryRequired, ReadRetryClient, load_state, save_state, state_lock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -245,30 +250,33 @@ sync_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 def _load_state() -> dict[str, Any]:
-    if STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text())
-            data.setdefault("shifts", {})
-            data.setdefault("jobs", {})  # legacy per-order job cache, unused by current code
-            data.setdefault("job_title_cache", {})
-            data.setdefault("poll_cursor", None)
-            # Migrate legacy single-"shiftId" entries to a "shiftIds" list —
-            # a tracked item can now correspond to more than one live
-            # Connecteam shift (see _find_sibling_shift_ids: Connecteam
-            # forks a whole new shift record, rather than adding to
-            # assignedUserIds, when a 2nd/3rd person is manually assigned to
-            # a Qty Rqrd > 1 shift).
-            for entry in data["shifts"].values():
-                if "shiftId" in entry:
-                    entry["shiftIds"] = [entry.pop("shiftId")]
-            return data
-        except (json.JSONDecodeError, OSError):
-            log.warning("Could not read state file %s, starting fresh", STATE_FILE)
-    return {"shifts": {}, "jobs": {}, "job_title_cache": {}, "poll_cursor": None}
+    data = load_state(STATE_FILE)
+    data.setdefault("jobs", {})
+    data.setdefault("job_title_cache", {})
+    data.setdefault("poll_cursor", None)
+    data.setdefault("pending_creates", {})
+    data.setdefault("retry_opportunities", {})
+    data.setdefault("exceptions", {})
+    for entry in data["shifts"].values():
+        if "shiftId" in entry:
+            entry["shiftIds"] = [entry.pop("shiftId")]
+    return data
 
 
 def _save_state(state: dict[str, Any]) -> None:
-    STATE_FILE.write_text(json.dumps(state))
+    state["schema_version"] = 2
+    save_state(STATE_FILE, state)
+
+
+@contextmanager
+def _sync_guard():
+    with sync_lock, state_lock(STATE_FILE):
+        yield
+
+
+def _record_exception(state, opportunity_id, message):
+    state.setdefault("exceptions", {})[str(opportunity_id)] = {"message": message, "at": int(time.time())}
+
 
 
 # ---------------------------------------------------------------------------
@@ -321,12 +329,17 @@ def fetch_opportunities_updated_since(client: httpx.Client, since_iso: str) -> l
             )
             resp.raise_for_status()
             body = resp.json()
-            ids.update(o["id"] for o in body["opportunities"])
+            page_ids = {o["id"] for o in body["opportunities"]}
+            if page > 1 and page_ids and not page_ids - ids:
+                raise RecoveryRequired("OnRent pagination did not advance")
+            ids.update(page_ids)
             meta = body.get("meta", {})
-            if page * meta.get("per_page", 100) >= meta.get("total_row_count", 0):
+            if len(body["opportunities"]) < 100 or ("total_row_count" in meta and page * meta.get("per_page", 100) >= meta["total_row_count"]):
                 break
             page += 1
-    return list(ids)
+            if page > 200:
+                raise RecoveryRequired("OnRent pagination exceeded bounded scan")
+    return sorted(ids)
 
 
 #  Current RMS represents "marked as dead/lost" as a `status`/`status_name`
@@ -431,8 +444,6 @@ def fetch_service_items(client: httpx.Client, opportunity_id: int) -> list[dict[
         item
         for item in items
         if item.get("item_type") == "Service"
-        and item.get("starts_at")
-        and item.get("ends_at")
         and item.get("name") not in EXCLUDED_SERVICE_NAMES
     ]
 
@@ -481,7 +492,9 @@ def _load_job_title_cache(client: httpx.Client) -> tuple[dict[str, str], dict[st
                 by_jobid_color[j["jobId"]] = j["color"]
         if len(jobs) < 500:
             break
-        offset = body.get("paging", {}).get("offset", offset + 500)
+        offset += len(jobs)
+        if offset > 20000:
+            raise RecoveryRequired("Jobs pagination exceeded bounded scan")
     return by_title, by_jobid_color
 
 
@@ -595,49 +608,106 @@ def update_shifts(client: httpx.Client, payloads: list[dict[str, Any]]) -> list[
     return updated
 
 
-def _find_sibling_shift_ids(
-    client: httpx.Client,
-    order_number: str | int | None,
-    shift_type: str,
-    job_id: str | None,
-    start: int,
-    end: int,
-) -> list[str]:
-    """Find every live Connecteam shift matching the same order ("Job No."
-    custom field), Shift Type/Notes, and Job (task type), sitting at the
-    given time — used to catch shifts Connecteam silently forks when a
-    2nd/3rd person is manually assigned to a Qty Rqrd > 1 shift. Confirmed
-    live 2026-09-07 (order 100004013, "Set up" item, Qty Rqrd 2): assigning
-    a second person does NOT add them to the original shift's
-    assignedUserIds — Connecteam clones an entirely separate shift record,
-    same Job/title/custom fields, at the same original time. Since the
-    public Shifts API has no working multi-assignee field (see
-    CONNECTEAM_QTY_CUSTOM_FIELD_ID), this clone is the only way multiple
-    people end up "on" one Qty Rqrd item, so every sync for such an item
-    must find and update every clone, not just the one we created. Callers
-    should search using the shift's current LIVE time (before this sync's
-    update is applied), since a not-yet-discovered clone still sits at that
-    original time. Small time padding covers any off-by-a-few-seconds
-    rounding; Job/order/type equality is what actually disambiguates."""
-    if not order_number:
+def list_shifts(client, start, end):
+    """Bounded, paginated reads with a forward-progress guard."""
+    result = []
+    seen = set()
+    offset = 0
+    while True:
+        response = client.get(
+            f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
+            headers={"X-API-KEY": CONNECTEAM_API_KEY},
+            params={"startTime": start, "endTime": end, "limit": 500, "offset": offset},
+        )
+        response.raise_for_status()
+        page = response.json().get("data", {}).get("shifts", [])
+        ids = {str(row["id"]) for row in page}
+        if page and (not ids - seen or len(result) + len(page) > 20000):
+            raise RecoveryRequired("Shift pagination did not advance or exceeded bounded scan")
+        result.extend(row for row in page if str(row["id"]) not in seen)
+        seen.update(ids)
+        if len(page) < 500:
+            return result
+        offset += len(page)
+
+
+def _note_html(shift):
+    return " ".join(note.get("html", "") for note in shift.get("notes", []) if isinstance(note, dict))
+
+
+def _find_sibling_shift_ids(client, order_number, shift_type, job_id, start, end, item_id=None):
+    # Require the source item marker copied by Connecteam, plus exact previous
+    # time. Job/description may be edited and are not reliable identities.
+    if not item_id:
         return []
-    headers = {"X-API-KEY": CONNECTEAM_API_KEY}
-    resp = client.get(
-        f"{CONNECTEAM_BASE_URL}/scheduler/v1/schedulers/{CONNECTEAM_SCHEDULER_ID}/shifts",
-        headers=headers,
-        params={"startTime": start - 300, "endTime": end + 300, "limit": 500},
-    )
-    resp.raise_for_status()
-    matches = []
-    for shift in resp.json().get("data", {}).get("shifts", []):
-        if shift.get("jobId") != job_id:
+    marker = f"(opportunity item #{item_id})"
+    return [row["id"] for row in list_shifts(client, start - 300, end + 300)
+            if marker in _note_html(row)
+            and row.get("startTime") == start and row.get("endTime") == end]
+
+
+def _merge_owned_notes(live, generated):
+    """Replace only the bridge paragraph, retaining manual notes and text."""
+    result = []
+    for note in live.get("notes", []):
+        if not isinstance(note, dict):
+            raise RecoveryRequired("Unexpected notes shape; refuse to overwrite manual notes")
+        if "html" not in note:
+            raise RecoveryRequired("Non-HTML manual notes present; preserve them for review")
+        content = note["html"]
+        if re.fullmatch(r"<p>Bridge identity: [a-f0-9]{32}</p>", content):
             continue
-        custom = {c.get("name"): c.get("value") for c in shift.get("customFields", [])}
-        if custom.get("Job No.") == str(order_number) and custom.get("Shift Type/Notes", "") == (
-            shift_type or ""
-        ):
-            matches.append(shift["id"])
-    return matches
+        if "Auto-created from Current RMS order " in content:
+            content = re.sub(r"<p>Auto-created from Current RMS order .*?</p>", "", content, flags=re.S)
+            content = re.sub(r"<p>Site contact: .*?</p>", "", content, flags=re.S)
+            content = re.sub(r"<p>Bridge identity: .*?</p>", "", content, flags=re.S)
+        if content.strip():
+            result.append({"html": content})
+    return result + generated
+
+
+def _durable_create(client, key, payload, desired, state):
+    pending = state.setdefault("pending_creates", {})
+    intent = pending.get(key)
+    if intent:
+        matches = [row for row in list_shifts(client, intent["payload"]["startTime"] - 86400,
+                    intent["payload"]["endTime"] + 86400)
+                   if intent["marker"] in _note_html(row)]
+        if len(matches) == 1:
+            row = matches[0]
+            if any(str(row["id"]) in {str(sid) for sid in entry.get("shiftIds", [])} for other_key, entry in state["shifts"].items() if other_key != key):
+                raise RecoveryRequired("Recovered create identity already belongs to another item")
+            state["shifts"][key] = {"shiftIds": [row["id"]], **intent["desired"]}
+            del pending[key]
+            _save_state(state)
+            return row
+        # Even an empty read is not proof that a timed-out POST never committed.
+        # Deliberately hold rather than replay an ambiguous create.
+        raise RecoveryRequired(f"Create outcome unresolved for item {key}; matches={len(matches)}")
+    marker = "Bridge identity: " + uuid.uuid4().hex
+    payload = {**payload, "notes": [dict(n) for n in payload.get("notes", [])]}
+    payload["notes"].append({"html": f"<p>{marker}</p>"})
+    desired = {**desired, "bridgeIdentity": marker}
+    pending[key] = {"marker": marker, "payload": payload, "desired": desired, "opportunityId": desired["opportunityId"]}
+    _save_state(state)  # write intent BEFORE sending any remote create
+    try:
+        rows = create_shifts(client, [payload])
+    except httpx.HTTPStatusError as exc:
+        # A definitive validation/auth rejection accepted no shift. Permit a
+        # later corrected retry; timeouts and server failures remain ambiguous.
+        if exc.response.status_code in {400, 401, 403, 404, 422, 429}:
+            del pending[key]
+            _save_state(state)
+        raise
+    if len(rows) != 1 or not rows[0].get("id"):
+        raise RecoveryRequired(f"Unexpected create response for item {key}; intent retained")
+    row = rows[0]
+    if any(str(row["id"]) in {str(sid) for sid in entry.get("shiftIds", [])} for other_key, entry in state["shifts"].items() if other_key != key):
+        raise RecoveryRequired("Create response identity already belongs to another item")
+    state["shifts"][key] = {"shiftIds": [row["id"]], **desired}
+    del pending[key]
+    _save_state(state)  # commit each accepted identity before the next request
+    return row
 
 
 def get_shift(client: httpx.Client, shift_id: str) -> dict[str, Any] | None:
@@ -762,7 +832,8 @@ def _split_into_daily_segments(
             return [(int(day_start.timestamp()), int((day_start + timedelta(days=1)).timestamp()))]
         return [(start, end)]
 
-    end_dt = datetime.fromtimestamp(end, tz=PERTH_TZ)
+    # The interval is [start, end): midnight belongs only to the previous day.
+    end_dt = datetime.fromtimestamp(end - 1, tz=PERTH_TZ)
     end_day = end_dt.date()
     if (end_day - start_day).days + 1 > MAX_SHIFT_SPAN_DAYS:
         return None
@@ -813,16 +884,25 @@ def _expand_service_segments(
     skipped: list[tuple[str, str]] = []
     protected_keys: set[str] = set()
     for service in services:
+        if service.get("status_name") == FINALISED_STATUS_NAME:
+            protected_keys.add(str(service["id"]))
+            continue
+        if not service.get("starts_at") or not service.get("ends_at"):
+            skipped.append((service["name"], "missing schedule; existing shifts protected"))
+            protected_keys.add(str(service["id"]))
+            continue
         start = _to_epoch_seconds(service["starts_at"])
         end = _to_epoch_seconds(service["ends_at"])
         if end <= start:
-            skipped.append((service["name"], "end time is not after start time"))
+            skipped.append((service["name"], "arrival milestone: equal times; destination support unverified" if end == start else "end before start; existing shifts protected"))
+            protected_keys.add(str(service["id"]))
             continue
 
         full_day = service.get("service_rate_type_name") == "Day"
         segments = _split_into_daily_segments(start, end, full_day=full_day)
         if segments is None:
             skipped.append((service["name"], f"span exceeds {MAX_SHIFT_SPAN_DAYS}-day split cap"))
+            protected_keys.add(str(service["id"]))
             continue
 
         finalised = service.get("status_name") == FINALISED_STATUS_NAME
@@ -863,6 +943,7 @@ def _cleanup_shift_keys(
     opportunity_id: int,
     reason: str,
     job_title_cache: dict[str, Any],
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Shared teardown for a set of tracked shift keys that should no longer
     exist (whole opportunity ineligible, or an individual service item gone
@@ -887,6 +968,16 @@ def _cleanup_shift_keys(
     notification_now = time.time()
     for key in keys:
         entry = shifts_state[key]
+        if entry.get("notificationFinalised"):
+            continue
+        # Discover copied source-item identity at the old schedule before deletion.
+        if state is not None and entry.get("quantity", 1) > 1:
+            siblings = _find_sibling_shift_ids(client, entry.get("orderNumber"), entry.get("description"), entry.get("jobId"), entry["startTime"], entry["endTime"], key.split(":", 1)[0])
+            owned_elsewhere = {sid for other_key, other in shifts_state.items() if other_key != key for sid in other.get("shiftIds", [])}
+            if any(sid in owned_elsewhere for sid in siblings):
+                raise RecoveryRequired("Cleanup sibling has conflicting ownership")
+            entry["shiftIds"] = list(dict.fromkeys(entry.get("shiftIds", []) + siblings))
+            _save_state(state)
         shift_ids = entry.get("shiftIds") or ([entry["shiftId"]] if "shiftId" in entry else [])
         tracked_shift_count += len(shift_ids)
         for shift_id in shift_ids:
@@ -908,7 +999,12 @@ def _cleanup_shift_keys(
                 deleted_published_blocks.append(f'"{title}" — {job_label} ({shift_id})')
             delete_shift(client, shift_id)
             deleted += 1
+            entry["shiftIds"] = [sid for sid in entry.get("shiftIds", []) if sid != shift_id]
+            if state is not None:
+                _save_state(state)
         del shifts_state[key]
+        if state is not None:
+            _save_state(state)
 
     if deleted_published_blocks:
         shift_word = "shift has" if len(deleted_published_blocks) == 1 else "shifts have"
@@ -940,7 +1036,7 @@ def cleanup_ineligible_opportunity(
     if not keys:
         return {"status": "skipped", "reason": reason, "tracked_shifts": 0}
 
-    result = _cleanup_shift_keys(client, keys, shifts_state, opportunity_id, reason, state["job_title_cache"])
+    result = _cleanup_shift_keys(client, keys, shifts_state, opportunity_id, reason, state["job_title_cache"], state)
     return {"status": "cleaned_up", "reason": reason, **result}
 
 
@@ -954,7 +1050,28 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     Safe to call repeatedly for the same opportunity — matches existing
     shifts by opportunity_item ID and only sends an update when something
     actually changed."""
-    opportunity = fetch_opportunity(client, opportunity_id)
+    state.setdefault("exceptions", {}).pop(str(opportunity_id), None)
+    # Resolve any uncertain earlier create before examining changed/deleted source.
+    for key, intent in list(state.setdefault("pending_creates", {}).items()):
+        if intent["opportunityId"] == opportunity_id:
+            _durable_create(client, key, intent["payload"], intent["desired"], state)
+    try:
+        opportunity = fetch_opportunity(client, opportunity_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 404:
+            raise
+        return cleanup_ineligible_opportunity(client, opportunity_id, "deleted (source 404)", state)
+
+    # Completion is archival; never erase crew history due to later metadata edits.
+    if opportunity.get("status_name") == FINALISED_STATUS_NAME:
+        for entry in state["shifts"].values():
+            if entry.get("opportunityId") == opportunity_id:
+                entry["notificationFinalised"] = True
+        _save_state(state)
+        return {"status": "skipped", "reason": "completed opportunity"}
+    if opportunity.get("status_name") == "Postponed":
+        _record_exception(state, opportunity_id, "Postponed: preserve shifts pending revised schedule")
+        return {"status": "held", "reason": "postponed policy requires review"}
 
     eligible, reason = _is_eligible(opportunity)
     if not eligible:
@@ -979,17 +1096,39 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             elif item_id in active_ids:
                 entry.pop("notificationFinalised", None)
 
-    # A service line item that's tracked (we made a shift for it before) but
-    # no longer shows up here — deleted from the opportunity, excluded, or
-    # had its dates cleared — is torn down the same way a whole ineligible
-    # opportunity is: deleted outright (draft or published), Chat notified
-    # if it was published. Same applies to a single-day-turned-multi-day (or
-    # vice versa) item's now-stale key, since _expand_service_segments
-    # changes key format between the two cases — current_keys covers every
-    # key that SHOULD exist right now (split or not) PLUS every finalised
-    # item's key, so a finalised item's shift is protected from this
-    # teardown rather than treated as removed.
+    # Removed source items retain the established cleanup policy. Validation,
+    # completion and changed split layouts instead protect the old identities.
     expanded_segments, segment_skips, protected_keys = _expand_service_segments(services)
+    # A source item survives validation failures and completion by identity,
+    # not by whatever split layout its current dates happen to produce.
+    held_ids = {key.split(":", 1)[0] for key in protected_keys}
+    cancelled_ids = {str(item["id"]) for item in services if item.get("status_name") == "Cancelled"}
+    postponed_ids = {str(item["id"]) for item in services if item.get("status_name") == "Postponed"}
+    held_ids |= postponed_ids
+    for item_id in postponed_ids | cancelled_ids:
+        segment_skips.append((item_id, "cancelled/postponed: existing shifts held for review"))
+    if opportunity_cancelled:
+        segment_skips.append((str(opportunity_id), "cancelled opportunity: existing shifts held for review"))
+    # Until cancellation policy is confirmed, never create or edit cancelled work.
+    held_ids |= cancelled_ids
+    if opportunity_cancelled:
+        held_ids |= {str(item["id"]) for item in services}
+        held_ids |= {key.split(":", 1)[0] for key, entry in shifts_state.items() if entry.get("opportunityId") == opportunity_id}
+    expected_by_item = {}
+    old_by_item = {}
+    for key, _, _, _ in expanded_segments:
+        expected_by_item.setdefault(key.split(":", 1)[0], set()).add(key)
+    for key, entry in shifts_state.items():
+        if entry.get("opportunityId") == opportunity_id:
+            old_by_item.setdefault(key.split(":", 1)[0], set()).add(key)
+    for item_id in expected_by_item.keys() & old_by_item.keys():
+        if expected_by_item[item_id] != old_by_item[item_id]:
+            held_ids.add(item_id)
+            segment_skips.append((item_id, "segment layout changed; preserve assignments pending migration review"))
+    protected_keys |= {key for key, entry in shifts_state.items() if entry.get("opportunityId") == opportunity_id and key.split(":", 1)[0] in held_ids}
+    # Cancelled items continue through the notification transition check below,
+    # but produce no create/update payloads.
+    expanded_segments = [row for row in expanded_segments if row[0].split(":", 1)[0] not in held_ids or row[0].split(":", 1)[0] in cancelled_ids or opportunity_cancelled]
     current_keys = {key for key, _, _, _ in expanded_segments} | protected_keys
     orphaned_keys = [
         k
@@ -1004,12 +1143,13 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             opportunity_id,
             "service item removed from opportunity",
             state["job_title_cache"],
+            state,
         )
         if orphaned_keys
         else None
     )
 
-    if not services:
+    if not services and not opportunity_cancelled:
         result: dict[str, Any] = {"status": "skipped", "reason": "no dated Service line items found"}
         if orphan_result:
             result["orphaned_items_cleaned_up"] = orphan_result
@@ -1053,12 +1193,19 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     to_update: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     unchanged = 0
     skipped: list[tuple[str, str]] = list(segment_skips)
-    # Service name per shift key, kept so a stale-Job-ID retry (see
-    # _is_stale_job_id_error below) can redo the title lookup after a forced
-    # cache refresh without re-walking the Current RMS service items.
-    service_name_by_key: dict[str, str] = {}
     cancellation_candidates: list[tuple[dict[str, Any], dict[str, Any], list[str]]] = []
     notification_cancelled_by_key: dict[str, bool] = {}
+
+    expanded_keys = {row[0] for row in expanded_segments}
+    for key, entry in shifts_state.items():
+        if entry.get("opportunityId") != opportunity_id or key in expanded_keys:
+            continue
+        if opportunity_cancelled or key.split(":", 1)[0] in cancelled_ids:
+            notification_cancelled_by_key[key] = True
+            if not entry.get("notificationCancelled") and not entry.get("notificationFinalised"):
+                live = [get_shift(client, sid) for sid in entry.get("shiftIds", [])]
+                published = [row["id"] for row in live if row and row.get("isPublished")]
+                cancellation_candidates.append((dict(entry), dict(entry), published))
 
     for key, service, start, end in expanded_segments:
 
@@ -1095,7 +1242,6 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         # what the line item is actually for.
         description = (service.get("description") or "").strip()
 
-        service_name_by_key[key] = service["name"]
         desired = {
             "opportunityId": opportunity_id,
             "startTime": start,
@@ -1128,12 +1274,13 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             f"(opportunity item #{service['id']}).</p>"
         )
         if site_contact:
-            notes_html += f"<p>Site contact: {site_contact}</p>"
+            notes_html += f"<p>Site contact: {html.escape(site_contact)}</p>"
         notes = [{"html": notes_html}]
 
         existing = shifts_state.get(key)
         previous_notification = dict(existing) if existing is not None else None
         published_ids: list[str] = []
+        live_by_id: dict[str, Any] = {}
         cancelled = opportunity_cancelled or service.get("status_name") == "Cancelled"
         notification_cancelled_by_key[key] = cancelled
         force_sync_siblings = False
@@ -1158,6 +1305,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
                     )
                     continue
                 live_ids.append(shift_id)
+                live_by_id[str(shift_id)] = live_shift
                 if live_shift.get("isPublished"):
                     published_ids.append(shift_id)
                 if primary_live_shift is None:
@@ -1169,17 +1317,26 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             # using the shift's still-live (pre-update) time so a
             # not-yet-tracked fork sitting at that time is found before this
             # sync's update is applied.
-            if quantity > 1 and primary_live_shift is not None:
+            if primary_live_shift is not None and max(quantity, existing.get("quantity", 1)) > 1:
                 for sibling_id in _find_sibling_shift_ids(
                     client,
                     order_number,
-                    description,
-                    job_id,
+                    existing.get("description", ""),
+                    existing.get("jobId"),
                     primary_live_shift["startTime"],
                     primary_live_shift["endTime"],
+                    str(service["id"]),
                 ):
                     if sibling_id not in live_ids:
+                        if any(sibling_id in other.get("shiftIds", []) for other_key, other in shifts_state.items() if other_key != key):
+                            raise RecoveryRequired("Sibling belongs to another tracked source item; refusing reassignment")
+                        sibling = get_shift(client, sibling_id)
+                        if sibling is None:
+                            continue
+                        live_by_id[str(sibling_id)] = sibling
                         live_ids.append(sibling_id)
+                        if sibling.get("isPublished"):
+                            published_ids.append(sibling_id)
                         force_sync_siblings = True
                         log.info(
                             "Discovered Connecteam-forked sibling shift %s for opportunity %s "
@@ -1198,6 +1355,9 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         # without claiming the Connecteam shift was deleted.
         if cancelled and previous_notification and not previous_notification.get("notificationCancelled"):
             cancellation_candidates.append((previous_notification, desired, published_ids))
+        if cancelled:
+            unchanged += 1
+            continue
         if existing is None:
             payload: dict[str, Any] = {
                 "startTime": start,
@@ -1231,12 +1391,16 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             # more than one live Connecteam shift (see the sibling-discovery
             # block above), and every one of them needs the same update.
             for shift_id in existing["shiftIds"]:
+                live = live_by_id[str(shift_id)]
+                generated_notes = [dict(n) for n in notes]
+                if existing.get("bridgeIdentity"):
+                    generated_notes.append({"html": f'<p>{existing["bridgeIdentity"]}</p>'})
                 update_payload: dict[str, Any] = {
                     "shiftId": shift_id,
                     "startTime": start,
                     "endTime": end,
                     "title": title,
-                    "notes": notes,
+                    "notes": _merge_owned_notes(live, generated_notes),
                     "customFields": custom_fields,
                 }
                 if job_id:
@@ -1245,76 +1409,38 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
                     update_payload["color"] = job_color
                 if address:
                     update_payload["locationData"] = {"isReferencedToJob": False, "gps": {"address": address}}
+                elif existing.get("address"):
+                    current_address = ((live.get("locationData") or {}).get("gps") or {}).get("address")
+                    if current_address != existing.get("address"):
+                        raise RecoveryRequired("Destination address differs from bridge-owned value; manual review required")
+                    update_payload["locationData"] = {"isReferencedToJob": False, "gps": None}
+                if existing.get("color") and not job_color:
+                    raise RecoveryRequired("Mapped color missing; preserve destination color pending review")
+                if existing.get("jobId") and not job_id:
+                    raise RecoveryRequired("Mapped Job missing; preserve destination Job pending mapping repair")
                 to_update.append((key, update_payload, desired))
         else:
             unchanged += 1
 
     if skipped:
+        _record_exception(state, opportunity_id, "; ".join(f"{name}: {reason}" for name, reason in skipped))
         for name, reason in skipped:
             log.warning("Skipped service '%s': %s", name, reason)
 
-    def _force_refresh_job_cache() -> None:
-        by_title, by_jobid_color = _load_job_title_cache(client)
-        cache = job_title_cache.setdefault("by_title", {})
-        color_cache = job_title_cache.setdefault("by_jobid_color", {})
-        cache.clear()
-        cache.update(by_title)
-        color_cache.clear()
-        color_cache.update(by_jobid_color)
+    created_shifts = []
+    for key, payload, desired in to_create:
+        created_shifts.append(_durable_create(client, key, payload, desired, state))
 
-    def _rebuild_job_fields(payload: dict[str, Any], desired: dict[str, Any], key: str) -> None:
-        prefix = CONNECTEAM_JOB_PREFIX.strip()
-        service_name = service_name_by_key[key]
-        mapped_name = SERVICE_JOB_OVERRIDES.get(service_name, service_name)
-        title = f"{prefix} {mapped_name}" if prefix else mapped_name
-        job_id = job_title_cache.get("by_title", {}).get(title)
-        job_color = job_id and job_title_cache.get("by_jobid_color", {}).get(job_id)
-        payload.pop("jobId", None)
-        payload.pop("color", None)
-        if job_id:
-            payload["jobId"] = job_id
-        if job_color:
-            payload["color"] = job_color
-        desired["jobId"] = job_id
-        desired["color"] = job_color or None
-
-    try:
-        created_shifts = create_shifts(client, [p for _, p, _ in to_create])
-    except httpx.HTTPStatusError as exc:
-        if not _is_stale_job_id_error(exc):
-            raise
-        log.warning(
-            "Connecteam rejected shift creation for opportunity %s due to a stale cached Job ID — "
-            "forcing a Job cache refresh and retrying once",
-            opportunity_id,
-        )
-        _force_refresh_job_cache()
-        for key, payload, desired in to_create:
-            _rebuild_job_fields(payload, desired, key)
-        created_shifts = create_shifts(client, [p for _, p, _ in to_create])
-
-    if len(created_shifts) != len(to_create):
-        log.warning(
-            "Created %d shifts but requested %d for opportunity %s — response ordering assumption may be wrong",
-            len(created_shifts), len(to_create), opportunity_id,
-        )
-    for (key, _, desired), shift_obj in zip(to_create, created_shifts):
-        shifts_state[key] = {"shiftIds": [shift_obj["id"]], **desired}
-
-    try:
-        updated_shifts = update_shifts(client, [p for _, p, _ in to_update])
-    except httpx.HTTPStatusError as exc:
-        if not _is_stale_job_id_error(exc):
-            raise
-        log.warning(
-            "Connecteam rejected shift update for opportunity %s due to a stale cached Job ID — "
-            "forcing a Job cache refresh and retrying once",
-            opportunity_id,
-        )
-        _force_refresh_job_cache()
-        for key, payload, desired in to_update:
-            _rebuild_job_fields(payload, desired, key)
-        updated_shifts = update_shifts(client, [p for _, p, _ in to_update])
+    # Update one source item (all of its siblings) at a time. If a response is
+    # short/uncertain, retain the old state and retry idempotent fields next time.
+    updated_shifts = []
+    for key in dict.fromkeys(key for key, _, _ in to_update):
+        group = [(k, p, d) for k, p, d in to_update if k == key]
+        rows = update_shifts(client, [p for _, p, _ in group])
+        expected = {str(p["shiftId"]) for _, p, _ in group}
+        if {str(row.get("id")) for row in rows} != expected:
+            raise RecoveryRequired(f"Update response identities incomplete for item {key}")
+        updated_shifts.extend(rows)
 
     # Snapshot pre-update state before it's overwritten below, so the
     # published-edit notification can describe exactly what changed.
@@ -1324,6 +1450,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         existing = shifts_state.get(key, {})
         existing.update(desired)
         shifts_state[key] = existing
+
+    _save_state(state)
 
     # A shift someone already published can still be in to_update (nothing
     # here checks publish state before editing — Current RMS changes are
@@ -1439,34 +1567,51 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     return result
 
 
+def _sync_and_checkpoint(client, opportunity_id, state):
+    """Never let advancing the poll cursor lose a failed opportunity."""
+    key = str(opportunity_id)
+    retry = state.setdefault("retry_opportunities", {})
+    retry[key] = {"attempted_at": time.time()}
+    _save_state(state)  # include webhook work before any outbound mutation
+    try:
+        result = sync_opportunity(client, opportunity_id, state)
+        retry.pop(key, None)
+        state.setdefault("reconciled_at", {})[key] = time.time()
+        return result
+    except Exception as exc:
+        detail = type(exc).__name__
+        if isinstance(exc, httpx.HTTPStatusError):
+            detail += f" HTTP {exc.response.status_code}"
+        retry[key]["error"] = detail
+        _record_exception(state, opportunity_id, detail)
+        log.exception("Sync failed for opportunity %s; retained for retry", opportunity_id)
+        return {"status": "error", "detail": detail}
+    finally:
+        _save_state(state)
+
+
 def poll_all_open_orders() -> dict[str, Any]:
-    """Background/manual poll: sync every Order- or Quotation-state
-    opportunity updated since the last poll, so Service-item edits made
-    after conversion, and flag-driven Quotation eligibility changes (ticked,
-    unticked, gone dead/lost), are picked up even outside the instant
-    webhook paths."""
-    with sync_lock:
+    with _sync_guard():
         state = _load_state()
         poll_start = datetime.now(timezone.utc)
         cursor = state.get("poll_cursor")
         since = cursor or (poll_start - timedelta(hours=POLL_INITIAL_LOOKBACK_HOURS)).isoformat()
-
-        results: dict[str, Any] = {}
-        with httpx.Client(timeout=30) as client:
-            opportunity_ids = fetch_opportunities_updated_since(client, since)
-            for opportunity_id in opportunity_ids:
-                try:
-                    results[str(opportunity_id)] = sync_opportunity(client, opportunity_id, state)
-                except httpx.HTTPStatusError as exc:
-                    log.exception("Poll failed for opportunity %s", opportunity_id)
-                    results[str(opportunity_id)] = {
-                        "status": "error",
-                        "detail": f"{exc.response.status_code} {exc.response.text[:300]}",
-                    }
-
+        results = {}
+        with ReadRetryClient(timeout=30) as client:
+            changed = fetch_opportunities_updated_since(client, since)
+            retry_ids = [int(key) for key in state.setdefault("retry_opportunities", {})]
+            # Direct reads catch deletes and state changes outside list filters.
+            # At most ten tracked opportunities per poll, each at most daily.
+            tracked = {e["opportunityId"] for e in state["shifts"].values() if not e.get("notificationFinalised")}
+            tracked |= {e["opportunityId"] for e in state.get("pending_creates", {}).values()}
+            checked = state.setdefault("reconciled_at", {})
+            due = sorted((oid for oid in tracked if time.time() - checked.get(str(oid), 0) >= 86400), key=lambda oid: (checked.get(str(oid), 0), oid))[:10]
+            ids = list(dict.fromkeys(changed + retry_ids + due))
+            for opportunity_id in ids:
+                results[str(opportunity_id)] = _sync_and_checkpoint(client, opportunity_id, state)
         state["poll_cursor"] = (poll_start - timedelta(minutes=POLL_OVERLAP_MINUTES)).isoformat()
+        state["last_poll_completed_at"] = time.time()
         _save_state(state)
-
     log.info("Poll checked %d opportunit(y/ies): %s", len(results), results)
     return {"checked": len(results), "since": since, "results": results}
 
@@ -1511,16 +1656,12 @@ async def opportunity_converted(request: Request, token: str | None = None):
         raise HTTPException(status_code=400, detail="action.subject_id missing")
 
     def _run() -> dict[str, Any]:
-        with sync_lock:
+        with _sync_guard():
             state = _load_state()
-            with httpx.Client(timeout=30) as client:
-                if action.get("Action_type") == "destroy":                # Deleted opportunity: fetch_opportunity would 404, so clean up tracked shifts directly.
-                    result = cleanup_ineligible_opportunity(client, opportunity_id, "deleted", state)
-                    result = {"status": "skipped", "reason": "deleted", **result}
-                else:
-                    result = sync_opportunity(client, opportunity_id, state)
-            _save_state(state)
-            return result
+            # Always fetch source truth, including destroy actions (404 cleanup).
+            # This also reconciles any pending create before removing mappings.
+            with ReadRetryClient(timeout=30) as client:
+                return _sync_and_checkpoint(client, int(opportunity_id), state)
 
     try:
         result = await asyncio.to_thread(_run)
@@ -1531,6 +1672,8 @@ async def opportunity_converted(request: Request, token: str | None = None):
             detail=f"upstream error: {exc.response.status_code} {exc.response.text[:500]}",
         ) from exc
 
+    if result.get("status") == "error":
+        raise HTTPException(status_code=502, detail="Sync failed and retained for retry")
     log.info("Webhook processed opportunity %s: %s", opportunity_id, result)
     return JSONResponse({"opportunity_id": opportunity_id, **result})
 
@@ -1552,3 +1695,20 @@ async def manual_sync(token: str | None = None):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "time": int(time.time())}
+
+
+@app.get("/readyz")
+async def readyz():
+    """Only aggregate operational health; no source records or credentials."""
+    try:
+        state = await asyncio.to_thread(_load_state)
+    except (RecoveryRequired, OSError):
+        return JSONResponse({"status": "state-recovery-required"}, status_code=503)
+    pending = len(state.get("pending_creates", {}))
+    retries = len(state.get("retry_opportunities", {}))
+    last_poll = state.get("last_poll_completed_at")
+    stale = ENABLE_SCHEDULER and (last_poll is None or time.time() - last_poll > max(900, 3 * POLL_INTERVAL_SECONDS))
+    return JSONResponse({"status": "degraded" if pending or retries or stale else "ok",
+                         "pending_creates": pending, "retry_opportunities": retries,
+                         "exceptions": len(state.get("exceptions", {})),
+                         "last_poll_completed_at": last_poll}, status_code=503 if pending or retries or stale else 200)

@@ -1,6 +1,8 @@
 """Offline sync regression tests: every upstream and Chat call is mocked."""
 import copy
 import os
+import tempfile
+from pathlib import Path
 import unittest
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
@@ -20,6 +22,8 @@ class NotificationsTest(unittest.TestCase):
         self.addCleanup(self.stack.close)
         def mock(name, **kwargs):
             return self.stack.enter_context(patch.object(app, name, **kwargs))
+        self.temp = self.stack.enter_context(tempfile.TemporaryDirectory())
+        mock("STATE_FILE", new=Path(self.temp) / "state.json")
         self.opportunity = {'id': 1, 'number': '1001', 'subject': 'Concert', 'state_name': 'Order', 'status_name': 'Active'}
         self.service = {'id': 10, 'name': 'Crew', 'starts_at': '2026-10-15T12:00:00+08:00', 'ends_at': '2026-10-15T16:00:00+08:00', 'quantity': '1.0', 'description': 'Setup'}
         self.entry = dict(opportunityId=1, orderNumber='1001', startTime=NOW+86400, endTime=NOW+100800,
@@ -75,11 +79,11 @@ class NotificationsTest(unittest.TestCase):
         self.sync()
         self.notify.assert_not_called()
         self.delete.assert_not_called()
-        self.assertEqual(self.update.call_args.args[1], [])
+        self.update.assert_not_called()
         self.assertTrue(self.state['shifts']['10']['notificationFinalised'])
         self.opportunity['status_name'] = 'Dead'
         result = self.sync()
-        self.assertEqual(result['deleted_published_count'], 1)
+        self.assertEqual(result['deleted_published_count'], 0)
         self.notify.assert_not_called()
 
     def test_past_edit_syncs_without_alert(self):
@@ -175,7 +179,8 @@ class NotificationsTest(unittest.TestCase):
     def test_completed_opportunity_silences_operational_diff(self):
         self.opportunity['status_name'] = 'Completed'
         self.service['description'] = 'Finalisation changes'
-        self.assertEqual(self.sync()['updated_count'], 1)
+        self.assertEqual(self.sync()['status'], 'skipped')
+        self.update.assert_not_called()
         self.notify.assert_not_called()
 
     def test_past_status_cancellation_silent(self):
