@@ -70,6 +70,7 @@ import asyncio
 import hmac
 import json
 import logging
+from log_redaction import install_log_redaction
 import os
 import threading
 import time
@@ -87,6 +88,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+install_log_redaction()
 log = logging.getLogger("rms-connecteam-bridge")
 
 # ---------------------------------------------------------------------------

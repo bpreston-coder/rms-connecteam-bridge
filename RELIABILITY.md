@@ -93,3 +93,14 @@ release. Daily reconciliation is report-only, stored in reconciliation_reports
 and summarized by /readyz. Review reports even when the normal poll is healthy.
 Automatic historical repair and explicit Cancelled deletion remain deferred.
 There is no bulk mapping migration. Missing/ambiguous records retain their IDs.
+
+## Forward-only log credential redaction
+
+Application startup wraps the existing root and Uvicorn output formatters with
+query-credential redaction. Access request method/path, status, client metadata,
+ordinary query parameters and exception tracebacks are retained. Token/key query
+values (including encoded names and repeated parameters) are hidden in access,
+HTTPX and exception output. Authentication and outbound URLs remain unchanged.
+This applies to new application output only; it does not remove historical logs
+or change Render's separate platform request logging. If logging configuration is
+replaced after app import, install_log_redaction must be called again.
