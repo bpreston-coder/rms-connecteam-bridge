@@ -1044,12 +1044,64 @@ def cleanup_ineligible_opportunity(
 # Core sync — idempotent, keyed off Current RMS opportunity_item IDs
 # ---------------------------------------------------------------------------
 
+def _assert_unique_ownership(state, opportunity_id):
+    owners = {}
+    for key, entry in state["shifts"].items():
+        for sid in set(map(str, entry.get("shiftIds", []))):
+            owners.setdefault(sid, []).append(key)
+    conflicts = {sid: keys for sid, keys in owners.items() if len(keys) > 1 and any(state["shifts"][key].get("opportunityId") == opportunity_id for key in keys)}
+    if conflicts:
+        raise RecoveryRequired("Destination identity has multiple source owners: " + "; ".join(f"{sid}={','.join(keys)}" for sid, keys in conflicts.items()))
+
+
+def reconcile_report(client, opportunity_id, state):
+    """GET-only audit. Never invoke sync, cleanup, notifications or remote writes."""
+    issues = []
+    entries = {k: e for k, e in state["shifts"].items() if e.get("opportunityId") == opportunity_id}
+    try:
+        _assert_unique_ownership(state, opportunity_id)
+    except RecoveryRequired as exc:
+        issues.append(str(exc))
+    try:
+        opportunity = fetch_opportunity(client, opportunity_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 404:
+            raise
+        return {"mode": "report_only", "issues": issues + ["Source 404; cleanup requires review"], "checked_at": time.time()}
+    eligible, reason = _is_eligible(opportunity)
+    if not eligible or opportunity.get("status_name") in {"Cancelled", "Postponed", FINALISED_STATUS_NAME}:
+        issues.append(f"Source status/state requires review: {opportunity.get('status_name')} / {reason}")
+    services = fetch_service_items(client, opportunity_id)
+    expanded, skips, _ = _expand_service_segments(services)
+    source_ids = {str(item["id"]) for item in services}
+    source_by_key = {key: (item, start, end) for key, item, start, end in expanded}
+    for name, reason in skips:
+        issues.append(f"{name}: {reason}")
+    for key, entry in entries.items():
+        if key.split(":", 1)[0] not in source_ids:
+            issues.append(f"{key}: source item absent; no deletion performed")
+        elif key in source_by_key:
+            item, start, end = source_by_key[key]
+            if (start, end) != (entry.get("startTime"), entry.get("endTime")) or (item.get("description") or "").strip() != entry.get("description", ""):
+                issues.append(f"{key}: source schedule/description differs; no update performed")
+        for sid in entry.get("shiftIds", []):
+            live = get_shift(client, sid)
+            if live is None:
+                issues.append(f"{key}: destination {sid} absent; no recreation performed")
+            elif any(live.get(field) != entry.get(field) for field in ("startTime", "endTime", "title", "jobId", "color")):
+                issues.append(f"{key}: destination {sid} differs from tracked values; no update performed")
+    for key in source_by_key.keys() - entries.keys():
+        issues.append(f"{key}: source segment untracked; no creation performed")
+    return {"mode": "report_only", "issues": issues, "checked_at": time.time()}
+
+
 def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str, Any]) -> dict[str, Any]:
     """Create/update draft Connecteam shifts for one order, and its linked
     Job. Mutates `state` in place; caller is responsible for persisting it.
     Safe to call repeatedly for the same opportunity — matches existing
     shifts by opportunity_item ID and only sends an update when something
     actually changed."""
+    _assert_unique_ownership(state, opportunity_id)
     state.setdefault("exceptions", {}).pop(str(opportunity_id), None)
     # Resolve any uncertain earlier create before examining changed/deleted source.
     for key, intent in list(state.setdefault("pending_creates", {}).items()):
@@ -1298,12 +1350,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             for shift_id in tracked_ids:
                 live_shift = get_shift(client, shift_id)
                 if live_shift is None:
-                    log.warning(
-                        "Tracked shift %s for opportunity %s (service item %s) no longer "
-                        "exists in Connecteam — dropping it.",
-                        shift_id, opportunity_id, key,
-                    )
-                    continue
+                    raise RecoveryRequired(f"Tracked destination {shift_id} for item {key} is absent; preserve mapping pending review")
                 live_ids.append(shift_id)
                 live_by_id[str(shift_id)] = live_shift
                 if live_shift.get("isPublished"):
@@ -1606,9 +1653,17 @@ def poll_all_open_orders() -> dict[str, Any]:
             tracked |= {e["opportunityId"] for e in state.get("pending_creates", {}).values()}
             checked = state.setdefault("reconciled_at", {})
             due = sorted((oid for oid in tracked if time.time() - checked.get(str(oid), 0) >= 86400), key=lambda oid: (checked.get(str(oid), 0), oid))[:10]
-            ids = list(dict.fromkeys(changed + retry_ids + due))
+            ids = list(dict.fromkeys(changed + retry_ids))
             for opportunity_id in ids:
                 results[str(opportunity_id)] = _sync_and_checkpoint(client, opportunity_id, state)
+            for opportunity_id in due:
+                try:
+                    report = reconcile_report(client, opportunity_id, state)
+                except Exception as exc:
+                    report = {"mode": "report_only", "issues": [type(exc).__name__], "checked_at": time.time()}
+                state.setdefault("reconciliation_reports", {})[str(opportunity_id)] = report
+                checked[str(opportunity_id)] = time.time()
+                log.info("Report-only reconciliation opportunity %s: %d issue(s)", opportunity_id, len(report["issues"]))
         state["poll_cursor"] = (poll_start - timedelta(minutes=POLL_OVERLAP_MINUTES)).isoformat()
         state["last_poll_completed_at"] = time.time()
         _save_state(state)
@@ -1711,4 +1766,6 @@ async def readyz():
     return JSONResponse({"status": "degraded" if pending or retries or stale else "ok",
                          "pending_creates": pending, "retry_opportunities": retries,
                          "exceptions": len(state.get("exceptions", {})),
+                         "reconciliation_mode": "report_only",
+                         "reconciliation_attention": sum(bool(r.get("issues")) for r in state.get("reconciliation_reports", {}).values()),
                          "last_poll_completed_at": last_poll}, status_code=503 if pending or retries or stale else 200)

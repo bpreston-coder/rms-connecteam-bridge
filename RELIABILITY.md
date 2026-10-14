@@ -15,7 +15,9 @@ leave previous tracked values for retry. Deletes checkpoint each accepted ID.
 
 Every opportunity is queued durably before work. Failed opportunities are retried
 on later polls independently of cursor advancement. A bounded daily reconciliation
-of tracked jobs catches source deletion and states outside the incremental filter.
+of tracked jobs reports source deletion and states outside the incremental filter.
+It performs GETs only; historical repairs are deferred pending review. Ordinary
+incremental changes and durable retries continue to synchronize.
 GET-only transient retries and per-poll Jobs/member caches reduce redundant calls.
 The shared TLS context avoids repeatedly parsing CA certificates; it is not proof
 that the observed long-running memory growth is fixed.
@@ -25,7 +27,9 @@ and missing dates. Midnight end times are exclusive when splitting long day-rate
 services. Existing split-key layout changes are held for a reviewed migration;
 assignments are never lost by an automatic delete/recreate. Sibling discovery uses
 source-item note identity and previous timestamps, with pagination and ownership
-checks, rather than mutable descriptions/job labels.
+checks, rather than mutable descriptions/job labels. Existing multiple-owner
+identities stop the affected opportunity before sync. Missing tracked destinations
+are held without dropping mappings or automatically recreating records.
 
 Updates preserve manual HTML notes and omit assignment/publication fields. API
 custom-field updates target only the three bridge-owned fields. Non-HTML notes
@@ -79,3 +83,13 @@ Code rollback: redeploy 3c56aaf with the current state file retained. If any pen
 create/retry exists, pause and resolve it first: the older code does not understand
 those recovery queues. Do not run two independently stored bridge instances against
 the same scheduler. The local file lock applies only to a shared persistent file.
+
+## Staged release decision
+
+The initial full planner proposed three recreations (3830 and 4070) and five
+updates (3830). Historical logs showed the old sibling matcher cross-associating
+destination IDs across daily keys. None of these repairs is applied by this
+release. Daily reconciliation is report-only, stored in reconciliation_reports
+and summarized by /readyz. Review reports even when the normal poll is healthy.
+Automatic historical repair and explicit Cancelled deletion remain deferred.
+There is no bulk mapping migration. Missing/ambiguous records retain their IDs.

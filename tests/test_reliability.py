@@ -147,6 +147,41 @@ class ReliabilitySyncTest(notifications.NotificationsTest):
         self.delete.assert_not_called()
         self.assertIn('10',self.state['shifts'])
 
+    def test_duplicate_destination_owners_stop_before_any_sync_read_or_write(self):
+        self.state['shifts']['10:1']=copy.deepcopy(self.entry)
+        with self.assertRaises(safety.RecoveryRequired): self.sync()
+        self.get.assert_not_called(); self.update.assert_not_called(); self.delete.assert_not_called(); self.create.assert_not_called()
+
+    def test_conflicting_other_opportunity_does_not_block_unrelated_work(self):
+        self.state['shifts']['20']={**self.entry,'opportunityId':2,'shiftIds':['other']}
+        self.state['shifts']['21']={**self.entry,'opportunityId':2,'shiftIds':['other']}
+        self.service['description']='New'
+        self.sync()
+        self.update.assert_called_once()
+
+    def test_missing_tracked_destination_is_held_not_recreated(self):
+        self.get.side_effect=None; self.get.return_value=None
+        with self.assertRaises(safety.RecoveryRequired): self.sync()
+        self.assertEqual(self.state['shifts']['10']['shiftIds'],['s1'])
+        self.create.assert_not_called(); self.delete.assert_not_called()
+
+    def test_daily_reconciliation_reports_missing_destination_without_mutations(self):
+        self.get.side_effect=None; self.get.return_value=None
+        before=copy.deepcopy(self.state)
+        report=app.reconcile_report(self.client,1,self.state)
+        self.assertEqual(self.state,before)
+        self.assertTrue(any('absent' in i for i in report['issues']))
+        self.create.assert_not_called(); self.update.assert_not_called(); self.delete.assert_not_called(); self.notify.assert_not_called()
+
+    def test_daily_due_does_not_enter_sync_or_retry_queue(self):
+        app._save_state(self.state)
+        with patch.object(app,'ReadRetryClient',return_value=MagicMock()), patch.object(app,'fetch_opportunities_updated_since',return_value=[]), patch.object(app,'sync_opportunity') as sync, patch.object(app,'reconcile_report',return_value={'mode':'report_only','issues':['missing'],'checked_at':1}) as report:
+            app.poll_all_open_orders()
+        sync.assert_not_called(); report.assert_called_once()
+        disk=app._load_state()
+        self.assertFalse(disk['retry_opportunities'])
+        self.assertEqual(disk['reconciliation_reports']['1']['issues'],['missing'])
+
     def test_postponed_service_is_not_rewritten(self):
         self.service.update(status_name='Postponed',description='Changed')
         self.sync()
