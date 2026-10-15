@@ -254,48 +254,94 @@ neither guarantees these orders will be synced.
    not validate arrival-note text, so explicit destination note inspection is
    required. Do not create synthetic shifts to validate this procedure.
 
-## Four-item transport recovery (review before live use)
+## Isolated four-item transport recovery (review before live use)
 
-`transport_recovery.py` is a separate, create-only recovery command. Its fixed
-approval boundary is opportunity/item pairs **4104/126172**, **4104/126173**,
-**4095/125805**, and **4095/125847**. It does not call whole-opportunity sync,
-modify staffing/Production Management, update or delete shifts, send Chat
-notifications, change source records, or reset poll/retry/reconciliation state.
-Created shifts are unassigned drafts with `notifyUsers=false`.
+This correction supersedes the global-pagination rollout in `ae488f4`.
+`app.py` is byte-for-byte the deployed `c423d9c` version. Complete OnRent
+pagination and the matching pure payload builder are in `recovery_support.py`,
+which is imported only by `transport_recovery.py`. Neither module is imported
+by the web app or scheduled poller. The pagination fix is implemented and tested
+for the isolated recovery; enabling it for global polling remains deferred.
+No live settings need to change. In particular, this rollout must not newly
+expose Production Management opportunity 3950 or unrelated staffing to sync.
+Existing background behavior is not suspended or otherwise modified.
 
-Run from the repository inside the existing service environment, with its
-normal credentials and `STATE_FILE` (do not copy credentials into commands):
+The recovery command has a fixed approval boundary: opportunity/item pairs
+**4104/126172**, **4104/126173**, **4095/125805**, and **4095/125847**. It does
+not call whole-opportunity sync, update/delete shifts, send Chat notifications,
+change source records, or reset poll/retry/reconciliation state. Created shifts
+are unassigned drafts with `notifyUsers=false`.
 
-```bash
-python -m transport_recovery
-# After reviewing the complete dry-run and its digest:
-python -m transport_recovery --apply-digest <reviewDigest>
-```
+### Review and rollout sequence
 
-Dry-run is the default. Both modes use the ordinary process/file sync guard
-and require an existing state file. All four items are preflighted before any
-create: source eligibility, active status, exact transport classification,
-equal source times, job mapping, tracked identities, pending creates, and
-nearby destination candidates. Output includes current source subjects, item
-names/times, proposed payloads, actions and a review digest. Review these
-against the approved Crooked Colours and Master Painter transport items;
-event names are read from source, not inferred from IDs.
+1. Review the local correction diff and offline tests, including the byte-for-byte
+   live-app isolation test. Do not deploy the old `ae488f4` change as-is.
+2. After approval, stage only `transport_recovery.py` and `recovery_support.py`
+   in a separate directory in the existing Render service environment. Import
+   the existing deployed `app` using the project directory on `PYTHONPATH`.
+   This does not require restarting the service, replacing `app.py`, enabling
+   global pagination, or changing any live configuration or credentials.
+3. Establish the full relevant scheduler history and future horizon through
+   authenticated read-only inventory. Select explicit epoch-second scan bounds
+   covering that entire range, not just the source times. Run the dry-run:
 
-Apply re-reads source/destination data and rejects a changed specification.
-It uses normal durable create intents and mappings and reads back each mapped
-destination to verify identity, title/job, start/end and the sharp-arrival
-note. A repeated apply is a no-op for already matching targets and preserves
-their publication and assignments. A timeout never causes a blind repeat
-POST: an exact pending marker can be reconciled, otherwise recovery stops.
-Existing destination mismatches, missing tracked shifts, split layouts and
-untracked candidates are held for review. A partial apply is possible if a
-later remote call fails; earlier identities are already durably checkpointed.
+   ```bash
+   python -m transport_recovery --scan-start <epoch-start> --scan-end <epoch-end>
+   ```
 
-OnRent pagination now follows the actual unique records received rather than
-stopping at a short page relative to the requested 100 rows. Both opportunity
-and item listings exhaust the advertised total (or an empty terminal page
-when no total exists), with overlap, changing-total, premature-end and 200-page
-guards. Incomplete listings fail before orphan cleanup. This also affects
-ordinary background polling after deployment: previously unseen services may
-be discovered. Review that broader rollout separately; the four-item command
-does not run or advance the global poll.
+4. Review all four source subjects, item names/times, proposed payloads, actions,
+   scan bounds and digest. Confirm these are the approved Crooked Colours and
+   Master Painter transport items. Source subjects are read, not inferred from
+   IDs. No apply is justified by an incomplete or arbitrarily narrow inventory.
+5. Only after that review, run with the same bounds and the returned digest:
+
+   ```bash
+   python -m transport_recovery --scan-start <epoch-start> --scan-end <epoch-end> --apply-digest <reviewDigest>
+   ```
+
+Both modes use the normal process/file sync guard and require the existing
+state file. All four items are preflighted before any creates: source eligibility,
+active status, exact transport classification, equal source times, job mapping,
+tracked identities, pending creates and destination candidates. Apply re-reads
+source/destination data and rejects a changed specification or scan range.
+Normal durable create intents/mappings checkpoint each accepted identity.
+
+Fresh-create read-back verifies original start, end=start+60, title, job,
+full generated notes and durable identity marker, custom-field IDs/values,
+location reference/address, supplied color, publication=false and empty
+assignments. A failed read-back leaves the identity safely mapped with
+`recoveryValidationPending`; subsequent runs must pass the same strict checks
+before continuing. It never deletes, unpublishes, unassigns or rewrites the row
+to repair a mismatch. After successful fresh validation, later reruns preserve
+legitimate human publication, assignment and manual metadata. They still check
+source identity, title/job, times and arrival instruction.
+
+A timeout never causes a blind repeat POST: an exact pending marker may be
+reconciled, otherwise recovery stops. Missing tracked destinations, split
+layouts, conflicting mappings and untracked candidates hold for review.
+A later failure can leave an earlier subset created; their identities are
+already durable, and the reviewed specification can resume without duplicates.
+
+### Duplicate-search coverage
+
+The old ±1-day search could miss a source-marked shift moved several days or
+months away, so it could not establish that no destination already existed.
+Recovery now scans the entire explicitly reviewed date range once, without
+job/title/publication filters, exhausting offset pages through an empty page.
+It rejects overlap and the 200-page cap instead of writing on partial results.
+Each target's source marker is checked across that complete returned range;
+unmarked same-start/job/title lookalikes also cause a hold.
+
+Connecteam's shifts API requires `startTime` and `endTime` (see
+[Getting Shifts](https://developer.connecteam.com/docs/scheduler-get-shifts)).
+There is therefore no claim of unbounded/all-time duplicate detection: a row
+outside the selected range, with its source marker removed, or outside the
+API credential's visibility can evade this check. The reviewer must establish
+adequate bounds and access before apply. No destination inventory or live
+recovery was performed while preparing this correction.
+
+Complete OnRent pagination counts actual unique records, rather than assuming
+100 rows were returned. It exhausts the advertised total (or an empty page
+without metadata), with overlap, changing-total, premature-end and 200-page
+guards. The fix remains available only through the isolated support module
+until a separate global rollout is reviewed.
