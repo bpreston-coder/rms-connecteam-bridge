@@ -253,3 +253,49 @@ neither guarantees these orders will be synced.
    snapshot. Run the GET-only `reconcile_report` as an additional check; it does
    not validate arrival-note text, so explicit destination note inspection is
    required. Do not create synthetic shifts to validate this procedure.
+
+## Four-item transport recovery (review before live use)
+
+`transport_recovery.py` is a separate, create-only recovery command. Its fixed
+approval boundary is opportunity/item pairs **4104/126172**, **4104/126173**,
+**4095/125805**, and **4095/125847**. It does not call whole-opportunity sync,
+modify staffing/Production Management, update or delete shifts, send Chat
+notifications, change source records, or reset poll/retry/reconciliation state.
+Created shifts are unassigned drafts with `notifyUsers=false`.
+
+Run from the repository inside the existing service environment, with its
+normal credentials and `STATE_FILE` (do not copy credentials into commands):
+
+```bash
+python -m transport_recovery
+# After reviewing the complete dry-run and its digest:
+python -m transport_recovery --apply-digest <reviewDigest>
+```
+
+Dry-run is the default. Both modes use the ordinary process/file sync guard
+and require an existing state file. All four items are preflighted before any
+create: source eligibility, active status, exact transport classification,
+equal source times, job mapping, tracked identities, pending creates, and
+nearby destination candidates. Output includes current source subjects, item
+names/times, proposed payloads, actions and a review digest. Review these
+against the approved Crooked Colours and Master Painter transport items;
+event names are read from source, not inferred from IDs.
+
+Apply re-reads source/destination data and rejects a changed specification.
+It uses normal durable create intents and mappings and reads back each mapped
+destination to verify identity, title/job, start/end and the sharp-arrival
+note. A repeated apply is a no-op for already matching targets and preserves
+their publication and assignments. A timeout never causes a blind repeat
+POST: an exact pending marker can be reconciled, otherwise recovery stops.
+Existing destination mismatches, missing tracked shifts, split layouts and
+untracked candidates are held for review. A partial apply is possible if a
+later remote call fails; earlier identities are already durably checkpointed.
+
+OnRent pagination now follows the actual unique records received rather than
+stopping at a short page relative to the requested 100 rows. Both opportunity
+and item listings exhaust the advertised total (or an empty terminal page
+when no total exists), with overlap, changing-total, premature-end and 200-page
+guards. Incomplete listings fail before orphan cleanup. This also affects
+ordinary background polling after deployment: previously unseen services may
+be discovered. Review that broader rollout separately; the four-item command
+does not run or advance the global poll.
