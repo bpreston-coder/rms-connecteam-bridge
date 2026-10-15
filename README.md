@@ -200,3 +200,23 @@ Offline regression tests (no live credentials or messages):
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## Equal-time transport arrivals
+
+For the ten exact delivery/collection Service names listed in
+`TRANSPORT_ARRIVAL_SERVICE_NAMES` (the reviewed Truck 8 Ton and Van 1 Ton
+variants), identical source start/end instants become a one-minute Connecteam
+slot: the original start is retained and the end is extended by exactly 60
+seconds. This also applies to Day rate transport milestones and midnight
+rollover. OnRent data is never modified.
+
+The generated note says, for example, “On site at 2:45pm sharp (AWST). The
+one-minute slot represents arrival only, not work duration.” It is replaced
+with the bridge-owned paragraph when the arrival changes, or removed when
+the source becomes a normal duration; manual notes are retained. Tracking
+includes this note so a change between an arrival milestone and an actual
+one-minute duration is detected even when destination times are identical.
+
+Unlisted names are not inferred from descriptions or destination job names.
+Non-transport equal times, reversed intervals, completed items, normal
+durations, and existing identity/layout safety rules keep their prior handling.

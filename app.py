@@ -223,6 +223,21 @@ SERVICE_JOB_OVERRIDES: dict[str, str] = {
 # opportunity would be, since fetch_service_items simply stops returning it.
 EXCLUDED_SERVICE_NAMES = {"Per diem", "Accomodation - Per night"}
 
+# Exact source Service names from the reviewed transport job mappings above.
+# Do not infer transport from a job title, description, or partial name match.
+TRANSPORT_ARRIVAL_SERVICE_NAMES = frozenset({
+    "Truck 8 Ton - Collection (Distance)",
+    "Truck 8 Ton - Delivery (Distance)",
+    "Truck 8 Ton - Perth Collection",
+    "Truck 8 Ton - Perth Collection (After hours and Weekend)",
+    "Truck 8 Ton - Perth Delivery",
+    "Truck 8 Ton - Perth Delivery (After hours and Weekend)",
+    "Van 1 Ton Perth Collection",
+    "Van 1 Ton Perth Collection  (After hours and Weekend)",
+    "Van 1 Ton Perth Delivery",
+    "Van 1 Ton Perth Delivery (After hours and Weekend)",
+})
+
 # A Service line item's status_name once someone finalises/completes it in
 # Current RMS (after which Current RMS itself won't let it be edited
 # further). Once finalised, the bridge leaves its shift completely alone —
@@ -857,6 +872,17 @@ def _split_into_daily_segments(
     return segments
 
 
+def _transport_arrival_time(service: dict[str, Any]) -> int | None:
+    """Identify an equal-time transport milestone without changing source data."""
+    if service.get("name") not in TRANSPORT_ARRIVAL_SERVICE_NAMES:
+        return None
+    if not service.get("starts_at") or not service.get("ends_at"):
+        return None
+    start = datetime.fromisoformat(service["starts_at"].replace("Z", "+00:00"))
+    end = datetime.fromisoformat(service["ends_at"].replace("Z", "+00:00"))
+    return _to_epoch_seconds(service["starts_at"]) if start == end else None
+
+
 def _expand_service_segments(
     services: list[dict[str, Any]],
 ) -> tuple[list[tuple[str, dict[str, Any], int, int]], list[tuple[str, str]], set[str]]:
@@ -895,6 +921,11 @@ def _expand_service_segments(
             continue
         start = _to_epoch_seconds(service["starts_at"])
         end = _to_epoch_seconds(service["ends_at"])
+        if _transport_arrival_time(service) is not None:
+            # Arrival only: keep the original start, even for Day rate items
+            # and midnight rollover. Bypass full-day expansion deliberately.
+            expanded.append((str(service["id"]), service, start, end + 60))
+            continue
         if end <= start:
             skipped.append((service["name"], "arrival milestone: equal times; destination support unverified" if end == start else "end before start; existing shifts protected"))
             protected_keys.add(str(service["id"]))
@@ -1296,6 +1327,16 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         # what the line item is actually for.
         description = (service.get("description") or "").strip()
 
+        arrival_time = _transport_arrival_time(service)
+        arrival_note = None
+        if arrival_time is not None:
+            local = datetime.fromtimestamp(arrival_time, tz=PERTH_TZ)
+            clock = f"{local.hour % 12 or 12}:{local.minute:02d}{'am' if local.hour < 12 else 'pm'}"
+            arrival_note = (
+                f"On site at {clock} sharp (AWST). "
+                "The one-minute slot represents arrival only, not work duration."
+            )
+
         desired = {
             "opportunityId": opportunity_id,
             "startTime": start,
@@ -1308,6 +1349,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             "quantity": quantity,
             "description": description,
             "siteContact": site_contact,
+            "arrivalNote": arrival_note,
         }
 
         custom_fields = []
@@ -1325,7 +1367,9 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         notes_html = (
             f"<p>Auto-created from Current RMS order "
             f"{opportunity.get('number', opportunity['id'])} "
-            f"(opportunity item #{service['id']}).</p>"
+            f"(opportunity item #{service['id']})."
+            + (f" {arrival_note}" if arrival_note else "")
+            + "</p>"
         )
         if site_contact:
             notes_html += f"<p>Site contact: {html.escape(site_contact)}</p>"
@@ -1434,6 +1478,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
             or existing.get("quantity") != quantity
             or existing.get("description") != description
             or existing.get("siteContact") != site_contact
+            or existing.get("arrivalNote") != arrival_note
             or force_sync_siblings
         ):
             # One payload per tracked shiftId — a Qty Rqrd > 1 item can have
