@@ -7,6 +7,7 @@ from datetime import datetime
 import html
 from typing import Any
 import httpx
+from rms_pagination import fetch_pages
 from app import (
     CURRENT_RMS_BASE_URL, CURRENT_RMS_STATE_ORDER, CURRENT_RMS_STATE_QUOTATION,
     EXCLUDED_SERVICE_NAMES, PERTH_TZ, CONNECTEAM_JOBNO_CUSTOM_FIELD_ID,
@@ -16,44 +17,8 @@ from app import (
 
 
 def _fetch_rms_pages(client, path, collection, params=None):
-    """Exhaust actual pages; OnRent can return 25 despite per_page=100.
-
-    Count received IDs against the advertised total, never assume the requested
-    page size was honored. Without a total, require an empty terminal page.
-    Partial, overlapping or unstable listings fail before sync can clean up.
-    """
-    rows, seen = [], set()
-    expected_total = None
-    for page in range(1, 201):
-        response = client.get(f"{CURRENT_RMS_BASE_URL}{path}", headers=rms_headers(),
-                              params={**(params or {}), "page": page, "per_page": 100})
-        response.raise_for_status()
-        body = response.json()
-        batch = body[collection]
-        if not isinstance(batch, list):
-            raise RecoveryRequired("Invalid OnRent pagination rows")
-        total = (body.get("meta") or {}).get("total_row_count")
-        if total is not None:
-            if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-                raise RecoveryRequired("Invalid OnRent pagination total")
-            if expected_total is not None and total != expected_total:
-                raise RecoveryRequired("OnRent pagination total changed during scan")
-            expected_total = total
-        ids = [row["id"] for row in batch]
-        if len(set(ids)) != len(ids) or seen.intersection(ids):
-            raise RecoveryRequired("OnRent pagination did not advance cleanly")
-        rows.extend(batch)
-        seen.update(ids)
-        if expected_total is not None:
-            if len(rows) > expected_total:
-                raise RecoveryRequired("OnRent pagination exceeded advertised total")
-            if len(rows) == expected_total:
-                return rows
-            if not batch:
-                raise RecoveryRequired("OnRent pagination ended before advertised total")
-        elif not batch:
-            return rows
-    raise RecoveryRequired("OnRent pagination exceeded bounded scan")
+    rows, _ = fetch_pages(client, f"{CURRENT_RMS_BASE_URL}{path}", rms_headers(), collection, params)
+    return rows
 
 
 def fetch_opportunities_updated_since(client: httpx.Client, since_iso: str) -> list[int]:

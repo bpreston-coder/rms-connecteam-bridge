@@ -192,6 +192,8 @@ def plan_digest(plans):
 
 
 def run_recovery(*, apply_digest=None, scan_start=None, scan_end=None):
+    if getattr(app, 'ITEM_RECOVERY_POLICY_VERSION', None) != 1:
+        raise RecoveryRequired('Compatible item-pagination and validation-hold poller required')
     if (type(scan_start) is not int or type(scan_end) is not int or scan_start >= scan_end):
         raise RecoveryRequired('Explicit reviewed destination scan bounds are required')
     with app._sync_guard():

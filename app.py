@@ -79,6 +79,7 @@ import uuid
 import html
 from contextlib import contextmanager
 from bridge_safety import RecoveryRequired, ReadRetryClient, load_state, save_state, state_lock
+from rms_pagination import fetch_pages, ServiceListing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -173,6 +174,10 @@ PERTH_TZ = timezone(timedelta(hours=8))
 STATE_FILE = Path(os.environ.get("STATE_FILE", "./processed_orders.json"))
 
 MAX_SHIFT_SECONDS = 24 * 60 * 60  # Connecteam: a shift can't exceed 24h.
+
+# The recovery CLI must not run against a poller that can undo its mappings or
+# ignore its validation quarantine. Bump only with a reviewed policy change.
+ITEM_RECOVERY_POLICY_VERSION = 1
 
 # A Service line item spanning more than one calendar day becomes one shift
 # PER Australia/Perth calendar day it touches (see _split_into_daily_segments)
@@ -438,31 +443,14 @@ def fetch_member_name(client: httpx.Client, member_id: int | None) -> str | None
 
 
 def fetch_service_items(client: httpx.Client, opportunity_id: int) -> list[dict[str, Any]]:
-    """Return opportunity_items where item_type == 'Service' and both
-    starts_at/ends_at are populated (i.e. an actual scheduled service, not a
-    group/header row)."""
-    items: list[dict[str, Any]] = []
-    page = 1
-    while True:
-        resp = client.get(
-            f"{CURRENT_RMS_BASE_URL}/api/v1/opportunities/{opportunity_id}/opportunity_items",
-            headers=rms_headers(),
-            params={"page": page, "per_page": 100},
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        items.extend(body["opportunity_items"])
-        meta = body.get("meta", {})
-        if page * meta.get("per_page", 100) >= meta.get("total_row_count", 0):
-            break
-        page += 1
-
-    return [
-        item
-        for item in items
-        if item.get("item_type") == "Service"
-        and item.get("name") not in EXCLUDED_SERVICE_NAMES
-    ]
+    """Read completely before cleanup; gate newly revealed creates separately."""
+    items, legacy_ids = fetch_pages(client,
+        f"{CURRENT_RMS_BASE_URL}/api/v1/opportunities/{opportunity_id}/opportunity_items",
+        rms_headers(), "opportunity_items")
+    return ServiceListing([
+        item for item in items
+        if item.get("item_type") == "Service" and item.get("name") not in EXCLUDED_SERVICE_NAMES
+    ], legacy_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -1001,7 +989,7 @@ def _cleanup_shift_keys(
     notification_now = time.time()
     for key in keys:
         entry = shifts_state[key]
-        if entry.get("notificationFinalised"):
+        if opportunity_id == 3950 or entry.get("recoveryValidationPending") or entry.get("notificationFinalised"):
             continue
         # Discover copied source-item identity at the old schedule before deletion.
         if state is not None and entry.get("quantity", 1) > 1:
@@ -1134,6 +1122,19 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     Safe to call repeatedly for the same opportunity — matches existing
     shifts by opportunity_item ID and only sends an update when something
     actually changed."""
+    # Explicit rollout exclusion, before pending-create reconciliation or cleanup.
+    if opportunity_id == 3950:
+        return {"status": "held", "reason": "Production Management 3950 excluded from rollout"}
+    validation_held = any(
+        entry.get("opportunityId") == opportunity_id and entry.get("recoveryValidationPending")
+        for entry in state["shifts"].values()
+    ) or any(
+        intent.get("opportunityId") == opportunity_id
+        and intent.get("desired", {}).get("recoveryValidationPending")
+        for intent in state.get("pending_creates", {}).values()
+    )
+    if validation_held:
+        return {"status": "held", "reason": "recovery destination validation requires review"}
     _assert_unique_ownership(state, opportunity_id)
     state.setdefault("exceptions", {}).pop(str(opportunity_id), None)
     # Resolve any uncertain earlier create before examining changed/deleted source.
@@ -1166,6 +1167,16 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     services = fetch_service_items(client, opportunity_id)
     shifts_state: dict[str, Any] = state["shifts"]
 
+    # Complete reads may reveal Services the legacy item reader never saw.
+    # Preserve ordinary work for already-visible/tracked items; newly discovered
+    # untracked items are report-only, including unrelated staffing.
+    legacy_ids = getattr(services, "legacy_visible_ids", None)
+    tracked_item_ids = {key.split(":", 1)[0] for key, entry in shifts_state.items()
+                        if entry.get("opportunityId") == opportunity_id}
+    newly_revealed_ids = {str(item["id"]) for item in services
+                          if legacy_ids is not None and item["id"] not in legacy_ids
+                          and str(item["id"]) not in tracked_item_ids}
+
     # Notification metadata only: remember completion even when a later
     # whole-opportunity cancellation enters cleanup before fetching items.
     # Include all tracked segment keys, including an old split layout.
@@ -1184,6 +1195,11 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     # Removed source items retain the established cleanup policy. Validation,
     # completion and changed split layouts instead protect the old identities.
     expanded_segments, segment_skips, protected_keys = _expand_service_segments(services)
+    if newly_revealed_ids:
+        expanded_segments = [row for row in expanded_segments
+                             if row[0].split(":", 1)[0] not in newly_revealed_ids]
+        segment_skips.extend((item_id, "newly revealed service: report-only pending rollout review")
+                             for item_id in sorted(newly_revealed_ids))
     # A source item survives validation failures and completion by identity,
     # not by whatever split layout its current dates happen to produce.
     held_ids = {key.split(":", 1)[0] for key in protected_keys}
@@ -1660,6 +1676,7 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
         "updated_count": len(updated_shifts),
         "unchanged_count": unchanged,
         "skipped_count": len(skipped),
+        "newly_revealed_item_ids": sorted(newly_revealed_ids),
     }
     if orphan_result:
         result["orphaned_items_cleaned_up"] = orphan_result
@@ -1816,6 +1833,7 @@ async def readyz():
     last_poll = state.get("last_poll_completed_at")
     stale = ENABLE_SCHEDULER and (last_poll is None or time.time() - last_poll > max(900, 3 * POLL_INTERVAL_SECONDS))
     return JSONResponse({"status": "degraded" if pending or retries or stale else "ok",
+                         "item_recovery_policy_version": ITEM_RECOVERY_POLICY_VERSION,
                          "pending_creates": pending, "retry_opportunities": retries,
                          "exceptions": len(state.get("exceptions", {})),
                          "reconciliation_mode": "report_only",
