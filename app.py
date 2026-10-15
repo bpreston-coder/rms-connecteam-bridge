@@ -1607,6 +1607,11 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
                     f'Notes — Original: "{_orange(previous.get("description"))}", '
                     f'Updated to: "{_green(desired.get("description"))}"'
                 )
+            if previous.get("arrivalNote") != desired.get("arrivalNote"):
+                changes.append(
+                    f'Arrival instruction — Original: "{_orange(previous.get("arrivalNote") or "No arrival-only instruction")}", '
+                    f'Updated to: "{_green(desired.get("arrivalNote") or "No arrival-only instruction")}"'
+                )
             if previous.get("siteContact") != desired.get("siteContact"):
                 changes.append(
                     f'Site contact — Original: "{_orange(previous.get("siteContact"))}", '

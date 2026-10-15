@@ -180,3 +180,84 @@ class TransportSyncTest(unittest.TestCase):
         self.sync()
         self.update.assert_called_once()
         self.notify.assert_not_called()
+
+    def poll(self):
+        with patch.object(app, 'ReadRetryClient') as client, patch.object(
+            app, 'fetch_opportunities_updated_since', return_value=[1]
+        ), patch.object(app, 'reconcile_report', return_value={'issues': []}):
+            client.return_value.__enter__.return_value = self.client
+            return app.poll_all_open_orders()
+
+    def test_arrival_semantics_alert_once_in_each_direction_then_polls_silent(self):
+        self.arrival()
+        self.sync()
+        self.live.update(self.update.call_args.args[1][0])
+        for end, expected_old, expected_new in (
+            ('2026-10-15T14:46:00+08:00', 'On site at 2:45pm sharp', 'No arrival-only instruction'),
+            (self.service['starts_at'], 'No arrival-only instruction', 'On site at 2:45pm sharp'),
+        ):
+            with self.subTest(end=end):
+                self.notify.reset_mock()
+                self.update.reset_mock()
+                self.service['ends_at'] = end
+                self.poll()
+                self.notify.assert_called_once()
+                message = self.notify.call_args.args[1]
+                self.assertIn('Arrival instruction — Original:', message)
+                self.assertIn(expected_old, message.split('Updated to:')[0])
+                self.assertIn(expected_new, message.split('Updated to:')[1])
+                self.assertNotIn('Time — Original:', message)
+                self.update.assert_called_once()
+                self.live.update(self.update.call_args.args[1][0])
+                self.poll()
+                self.poll()
+                self.notify.assert_called_once()
+                self.update.assert_called_once()
+        self.create.assert_not_called()
+        self.delete.assert_not_called()
+
+    def check_suppressed_semantic_transitions(self, gate):
+        self.arrival()
+        equal = self.service['starts_at']
+        minute = '2026-10-15T14:46:00+08:00'
+        for before, after in ((equal, minute), (minute, equal)):
+            with self.subTest(gate=gate, before=before):
+                self.service.pop('status_name', None)
+                self.opportunity['status_name'] = 'Active'
+                self.service['ends_at'] = before
+                self.sync()
+                self.live.update(self.update.call_args.args[1][0])
+                self.notify.reset_mock()
+                self.update.reset_mock()
+                self.service['ends_at'] = after
+                if gate == 'finalised_service':
+                    self.service['status_name'] = 'Completed'
+                elif gate == 'finalised_opportunity':
+                    self.opportunity['status_name'] = 'Completed'
+                elif gate == 'draft':
+                    self.live['isPublished'] = False
+                now = (app._to_epoch_seconds(minute) + 1 if gate == 'past' else notifications.NOW)
+                with patch.object(app.time, 'time', return_value=now):
+                    self.sync()
+                    if gate in ('draft', 'past'):
+                        self.update.assert_called_once()
+                        self.live.update(self.update.call_args.args[1][0])
+                    else:
+                        self.update.assert_not_called()
+                    self.sync()
+                self.notify.assert_not_called()
+                self.live['isPublished'] = True
+        self.create.assert_not_called()
+        self.delete.assert_not_called()
+
+    def test_past_semantic_changes_silent_in_both_directions(self):
+        self.check_suppressed_semantic_transitions('past')
+
+    def test_draft_semantic_changes_silent_in_both_directions(self):
+        self.check_suppressed_semantic_transitions('draft')
+
+    def test_finalised_service_semantic_changes_silent_in_both_directions(self):
+        self.check_suppressed_semantic_transitions('finalised_service')
+
+    def test_finalised_opportunity_semantic_changes_silent_in_both_directions(self):
+        self.check_suppressed_semantic_transitions('finalised_opportunity')

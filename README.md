@@ -220,3 +220,36 @@ one-minute duration is detected even when destination times are identical.
 Unlisted names are not inferred from descriptions or destination job names.
 Non-transport equal times, reversed intervals, completed items, normal
 durations, and existing identity/layout safety rules keep their prior handling.
+
+Arrival-instruction changes are included in operational edit notifications,
+including a transition to/from an ordinary one-minute duration with identical
+destination times. Existing published/active/work-remaining gates still apply;
+unchanged polls remain silent.
+
+### Targeted catch-up after deployment (procedure only)
+
+Previously skipped orders may not have changed since the poll cursor. `/sync`
+only triggers the incremental poll, and daily reconciliation is report-only;
+neither guarantees these orders will be synced.
+
+1. First verify each candidate opportunity ID with read-only source calls
+   (`fetch_opportunity` and `fetch_service_items`), confirming the subject,
+   eligibility, status, exact transport names and equal times. Do not infer an
+   event name from an ID such as 4104. Audit the entire opportunity using
+   `reconcile_report` and inspect tracked IDs and any pending creates before
+   approving a targeted sync: this sync processes all its services, including
+   existing update/cleanup and notification behavior.
+2. After deployment and approval, POST to the existing protected
+   `/webhooks/current-rms/opportunity-converted` route with JSON
+   `{"action":{"subject_type":"Opportunity","subject_id":<verified ID>}}`.
+   Supply the configured webhook token securely without printing it or placing
+   it in shell history. This invokes the existing sync guard and durable
+   checkpoint/retry path for that opportunity, without resetting the poll cursor
+   or editing source data. Check the response for errors before proceeding.
+3. Read back the state under the sync guard, then use `get_shift` for every
+   recorded destination ID for the affected items. Verify original start,
+   end=start+60, the AWST arrival-only note, source-item marker, job, publication
+   status and preserved assignments. Compare source dates again to the preflight
+   snapshot. Run the GET-only `reconcile_report` as an additional check; it does
+   not validate arrival-note text, so explicit destination note inspection is
+   required. Do not create synthetic shifts to validate this procedure.
