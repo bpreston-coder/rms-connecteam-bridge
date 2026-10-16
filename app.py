@@ -78,6 +78,7 @@ import re
 import uuid
 import html
 from contextlib import contextmanager
+from contextvars import ContextVar
 from bridge_safety import RecoveryRequired, ReadRetryClient, load_state, save_state, state_lock
 from rms_pagination import fetch_pages, ServiceListing
 from datetime import datetime, timedelta, timezone
@@ -179,6 +180,7 @@ MAX_SHIFT_SECONDS = 24 * 60 * 60  # Connecteam: a shift can't exceed 24h.
 # ignore its validation quarantine. Bump only with a reviewed policy change.
 ITEM_RECOVERY_POLICY_VERSION = 1
 OPPORTUNITY_HOLD_POLICY_VERSION = 1
+SANDALFORD_REPAIR_POLICY_VERSION = 1
 
 # A Service line item spanning more than one calendar day becomes one shift
 # PER Australia/Perth calendar day it touches (see _split_into_daily_segments)
@@ -266,6 +268,7 @@ app = FastAPI(title="Current RMS -> Connecteam bridge")
 # Serializes all sync work (webhook hits and the background poll can
 # otherwise race on the same state file / same opportunity).
 sync_lock = threading.Lock()
+_preview_state_writes = ContextVar('preview_state_writes', default=False)
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +291,8 @@ def _load_state() -> dict[str, Any]:
 
 
 def _save_state(state: dict[str, Any]) -> None:
+    if _preview_state_writes.get():
+        return  # Only a private copied-state convergence probe sets this context.
     state["schema_version"] = 2
     save_state(STATE_FILE, state)
 
@@ -677,6 +682,7 @@ def _merge_owned_notes(live, generated):
         if "html" not in note:
             raise RecoveryRequired("Non-HTML manual notes present; preserve them for review")
         content = note["html"]
+        content = re.sub(r'<p data-rms-bridge-arrival="1">[^<]*</p>', '', content)
         if re.fullmatch(r"<p>Bridge identity: [a-f0-9]{32}</p>", content):
             continue
         if "Auto-created from Current RMS order " in content:
@@ -1864,6 +1870,7 @@ async def readyz():
     return JSONResponse({"status": "degraded" if pending or retries or holds or stale else "ok",
                          "item_recovery_policy_version": ITEM_RECOVERY_POLICY_VERSION,
                          "opportunity_hold_policy_version": OPPORTUNITY_HOLD_POLICY_VERSION,
+                         "sandalford_repair_policy_version": SANDALFORD_REPAIR_POLICY_VERSION,
                          "opportunity_holds": holds,
                          "pending_creates": pending, "retry_opportunities": retries,
                          "exceptions": len(state.get("exceptions", {})),

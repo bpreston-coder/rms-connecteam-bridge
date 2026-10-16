@@ -213,10 +213,12 @@ def build_plan(client, state):
         notes = copy.deepcopy(row.get('notes'))
         require(isinstance(notes, list) and all(isinstance(n, dict) and isinstance(n.get('html'), str) for n in notes),
                 'Canonical notes cannot be safely preserved')
-        require('On site at ' not in app._note_html(row) or arrival in app._note_html(row),
-                'Conflicting existing arrival note requires review')
+        owned_arrival = f'<p data-rms-bridge-arrival="1">{arrival}</p>'
+        require('On site at ' not in app._note_html(row) or
+                (owned_arrival in app._note_html(row) and app._note_html(row).count('On site at ') == 1),
+                'Existing unowned or conflicting arrival note requires review')
         if arrival not in app._note_html(row):
-            notes.append({'type': 'html', 'html': f'<p>{arrival}</p>'})
+            notes.append({'type': 'html', 'html': f'<p data-rms-bridge-arrival="1">{arrival}</p>'})
         payload = {'shiftId': sid, 'startTime': start, 'endTime': start + 60, 'notes': notes}
         after = {**stable(row), 'startTime': start, 'endTime': start + 60, 'notes': notes}
         operations.insert(0, {'kind': 'update', 'id': sid, 'sourceKey': owners(state, sid)[0],
@@ -326,8 +328,91 @@ def apply_plan(client, state, plan, review_digest):
             'confirmed': list(journal['confirmed']), 'holdReleased': False}
 
 
-def run(*, plan=None, review_digest=None):
+class PreviewClient:
+    """No outgoing writes, even if wrapped repair client has an approved intent."""
+    def __init__(self, client):
+        self.client = client
+
+    def request(self, method, url, **kwargs):
+        require(method.upper() == 'GET', 'Normal sync would mutate; hold cannot be released')
+        return self.client.get(url, **kwargs)
+
+    def get(self, url, **kwargs):
+        return self.request('GET', url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self.request('POST', url, **kwargs)
+
+    def put(self, url, **kwargs):
+        return self.request('PUT', url, **kwargs)
+
+
+def normal_sync_converges(client, state):
+    """Execute real sync logic on a private copy, with disk/network writes blocked."""
+    preview = copy.deepcopy(state)
+    preview['opportunity_holds'].pop(str(OPPORTUNITY), None)
+    token = app._preview_state_writes.set(True)
+    try:
+        result = app.sync_opportunity(PreviewClient(client), OPPORTUNITY, preview)
+    finally:
+        app._preview_state_writes.reset(token)
+    require(result.get('status') == 'ok' and result.get('created_count') == 0
+            and result.get('updated_count') == 0 and result.get('skipped_count') == 0
+            and not result.get('newly_revealed_item_ids')
+            and not result.get('orphaned_items_cleaned_up'), 'Normal sync does not converge without actions')
+    def mapping(value):
+        result = scope(value)
+        # Ordinary sync records this default even when there is no cancellation.
+        for entry in result['shifts'].values():
+            if entry.get('notificationCancelled') is False:
+                entry.pop('notificationCancelled')
+        return result
+    require(mapping(preview) == mapping(state), 'Normal sync would change source ownership or tracked content')
+
+
+def release_hold(client, state, plan, review_digest, *, release=False):
+    """Caller holds shared lock. Review-only default; release changes local state only."""
+    check_allowlist()
+    journal = state.get('repair_journals', {}).get(JOURNAL_KEY, {})
+    require(digest(plan) == review_digest and journal.get('digest') == review_digest
+            and journal.get('plan') == plan, 'Release requires exact journaled review digest')
+    require(journal.get('status') in {'verified_held', 'released'} and journal.get('intent') is None
+            and len(journal.get('confirmed', [])) == len(plan['operations'])
+            and set(journal['confirmed']) == {op['id'] for op in plan['operations']},
+            'Repair actions are not fully confirmed')
+    already_released = journal['status'] == 'released'
+    hold = state.get('opportunity_holds', {}).get(str(OPPORTUNITY))
+    require((hold is None if already_released else
+             isinstance(hold, dict) and hold.get('journal') == JOURNAL_KEY
+             and hold.get('digest') == review_digest), 'Release hold ownership differs')
+    require(scope(state) == plan['afterScope'] and not scope(state)['pending_creates'],
+            'Final mapping or pending actions changed')
+    check_ownership(state, plan, final=True)
+    require(source_snapshot(client) == plan['source'], 'Source changed since repair')
+    verify_operators(client, plan)
+    for op in plan['operations']:
+        require(stable(app.get_shift(client, op['id'])) == op['after'], 'Release destination verification failed')
+    normal_sync_converges(client, state)
+    # The preview can be long; recheck source and exact destinations afterwards.
+    require(source_snapshot(client) == plan['source'], 'Source changed during convergence check')
+    verify_operators(client, plan)
+    for op in plan['operations']:
+        require(stable(app.get_shift(client, op['id'])) == op['after'], 'Destination changed during convergence check')
+    if release and not already_released:
+        # One durable atomic save: a crash leaves either verified_held or released.
+        next_state = copy.deepcopy(state)
+        del next_state['opportunity_holds'][str(OPPORTUNITY)]
+        next_state['repair_journals'][JOURNAL_KEY]['status'] = 'released'
+        app._save_state(next_state)
+        state.clear()
+        state.update(next_state)
+    return {'status': 'released' if release or already_released else 'release_ready',
+            'reviewDigest': review_digest, 'holdReleased': bool(release or already_released)}
+
+
+def run(*, plan=None, review_digest=None, check_release=False, release=False):
     require(getattr(app, 'OPPORTUNITY_HOLD_POLICY_VERSION', None) == 1, 'Hold-aware poller code required')
+    require(getattr(app, 'SANDALFORD_REPAIR_POLICY_VERSION', None) == 1, 'Owned-note convergence policy required')
     with app._sync_guard():
         require(app.STATE_FILE.is_file(), 'Existing production state required')
         state = app._load_state()
@@ -336,12 +421,15 @@ def run(*, plan=None, review_digest=None):
             # Render runs this helper beside the single poller on its local port.
             port = int(os.environ.get('PORT', '10000'))
             readiness = client.get(f'http://127.0.0.1:{port}/readyz').json()
-            require(readiness.get('opportunity_hold_policy_version') == 1,
-                    'Running poller has not confirmed durable hold support')
+            require(readiness.get('opportunity_hold_policy_version') == 1
+                    and readiness.get('sandalford_repair_policy_version') == 1,
+                    'Running poller has not confirmed hold and owned-note convergence support')
             if review_digest is None:
                 manifest = build_plan(client, state)
                 return {'reviewDigest': digest(manifest), 'plan': manifest}
             require(isinstance(plan, dict), 'Exact reviewed plan required')
+            if check_release or release:
+                return release_hold(client, state, plan, review_digest, release=release)
             return apply_plan(client, state, plan, review_digest)
 
 
@@ -349,10 +437,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan-file', type=Path)
     parser.add_argument('--apply-digest')
+    parser.add_argument('--check-release', action='store_true', help='GET-only convergence review; retain hold')
+    parser.add_argument('--release-hold', action='store_true', help='Reverify convergence and atomically release hold')
     args = parser.parse_args()
     require(bool(args.plan_file) == bool(args.apply_digest), 'Apply requires both plan file and digest')
+    require(not (args.check_release and args.release_hold), 'Choose check-release or release-hold')
+    require(not (args.check_release or args.release_hold) or bool(args.apply_digest), 'Release needs reviewed plan and digest')
     manifest = json.loads(args.plan_file.read_text())['plan'] if args.plan_file else None
-    print(json.dumps(run(plan=manifest, review_digest=args.apply_digest), indent=2))
+    print(json.dumps(run(plan=manifest, review_digest=args.apply_digest,
+                         check_release=args.check_release, release=args.release_hold), indent=2))
 
 
 if __name__ == '__main__':

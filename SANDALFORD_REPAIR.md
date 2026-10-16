@@ -23,7 +23,8 @@ unchanged. All ten deletion rows must be mapped exclusively to the two source
 transport items, unpublished and unassigned.
 
 Before a future execution, deploy the reviewed hold-aware poller with separate
-authorization. `/readyz` must report `opportunity_hold_policy_version: 1`. The
+authorization. `/readyz` must report both `opportunity_hold_policy_version: 1`
+and `sandalford_repair_policy_version: 1` (owned notes and convergence preview). The
 helper checks the running process at `127.0.0.1:$PORT` (default 10000), not just
 the staged Python module. Never stage the helper against the old process and
 assume it respects a hold. Do not restart during the ongoing Mac repair.
@@ -47,11 +48,20 @@ Future operator workflow, only after allowlist and deployment review:
    one atomic state save collapses the transport split keys to `125886` and
    `125887` and replaces only the missing operator ID under `126320`.
 
-**Hold release is intentionally not implemented.** Before release, independently
-verify no unresolved intents, exact destination/source/ownership convergence,
-and that a read-only normal-sync plan would not recreate or alter unintended
-shifts. Ordinary sync must not be used as a probe. A separate reviewed release
-step is required; this helper never temporarily removes the hold.
+5. With the same plan file and digest, add `--check-release` for a read-only
+   convergence review. It rechecks all ten deletions, both retained transports,
+   both operators, source data, ownership, and the completed journal. Actual
+   normal-sync logic then runs on a private state copy with remote mutations
+   blocked and disk saves disabled only in that execution context. It must plan
+   zero mutations and preserve mappings. Source/destinations are checked again.
+6. After that review and execution authorization, add `--release-hold` instead
+   to repeat all checks and atomically remove the hold while marking the journal
+   released. A failure retains the durable hold. This never removes the real
+   hold temporarily to run normal sync. Subsequent source edits use ordinary sync.
+
+The appended arrival paragraph has an explicit bridge-owned HTML attribute.
+Later ordinary time edits remove that paragraph and regenerate the arrival note,
+preserving manual text. Unowned pre-existing arrival text requires review.
 
 Polling remains `POLL_INTERVAL_SECONDS=300`. Approved target 90 is deferred during
 repair and pending actual quota verification. Connecteam's published account-wide
@@ -63,3 +73,32 @@ account allowance; never print credentials. At a persistent 21 Connecteam calls
 per cycle and 12 seconds of work, a 90-second wait estimates 17,788 calls/day,
 before webhooks, daily reconciliation or other integrations. Repair may reduce
 that retry workload; measure again before changing cadence.
+
+## Separate Crooked Colours location investigation
+
+The source venue and target job address were reported empty, while a created shift
+contains the literal address `"None"`. Do not accept that GPS as empty and do not
+clear its validation hold. Future recovery creates omit `locationData` when the
+source has no address, consistent with the optional field in the official
+[create guide](https://developer.connecteam.com/docs/scheduler-create-shifts).
+Read-back still rejects inherited location and any nonempty GPS for that case.
+
+An existing-ID correction remains unimplemented pending the exact shift IDs,
+source item IDs and current location JSON. The intended scope is one minimal
+`shiftId`/`locationData` PUT per explicitly reviewed existing ID with
+`notifyUsers=false`, under the shared lock and a durable hold/journal, preserving
+and verifying all other fields. The official
+[update guide](https://developer.connecteam.com/docs/scheduler-update-shifts)
+confirms omitted fields are retained, but its location example only demonstrates
+setting a nonempty address. It does not establish whether null GPS, an empty
+object, or an empty address clears this account's existing location. No candidate
+encoding is authorized for live experimentation. Obtain documented/support-confirmed
+clearing behavior before finalizing this correction, then require exact read-back
+with no GPS and unchanged assignment/publication/notes/times.
+
+Field `1353115` is still included on write as an empty string when the source
+description is empty. The narrow read-back comparison accepts its omission only
+for that explicitly empty expected value. The create guide makes the overall
+custom-fields array optional; this does not establish requiredness of this
+account's individual field. A string type definition and omitted GET value do
+not prove that requirement. No broader normalization or write omission is added.

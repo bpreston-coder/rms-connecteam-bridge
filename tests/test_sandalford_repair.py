@@ -9,6 +9,7 @@ from contextlib import ExitStack
 import test_notifications
 import app
 import sandalford_repair as repair
+REAL_UPDATE = app.update_shifts
 
 
 class HoldTest(unittest.TestCase):
@@ -43,15 +44,16 @@ class RepairTest(unittest.TestCase):
         self.temp = self.stack.enter_context(tempfile.TemporaryDirectory())
         self.stack.enter_context(patch.object(app, 'STATE_FILE', Path(self.temp) / 'state.json'))
         self.deletes = repair.DELETE_IDS
-        self.state = {'shifts': {}, 'exceptions': {'4071': {'message': 'prior'}},
+        self.state = {'shifts': {}, 'job_title_cache': {}, 'exceptions': {'4071': {'message': 'prior'}},
                       'retry_opportunities': {'4071': {'error': 'prior'}}, 'pending_creates': {}}
         self.rows = {}
         self.services = []
         self.writes = []
-        self.opportunity = {'id': 4071, 'number': repair.ORDER, 'state_name': 'Order', 'status_name': 'Active'}
+        self.opportunity = {'id': 4071, 'number': repair.ORDER, 'subject': 'Sandalford', 'state_name': 'Order', 'status_name': 'Active'}
         def entry(sid, job, start, end, quantity=1):
             return {'opportunityId': 4071, 'shiftIds': [sid], 'jobId': job, 'startTime': start,
                     'endTime': end, 'quantity': quantity, 'description': '', 'title': 'Sandalford',
+                    'siteContact': '', 'address': None, 'color': None, 'arrivalNote': None,
                     'notificationCancelled': False, 'orderNumber': repair.ORDER}
         def row(sid, key, e, published=False, users=None):
             return {'id': sid, 'jobId': e['jobId'], 'startTime': e['startTime'], 'endTime': e['endTime'],
@@ -254,14 +256,110 @@ class RepairTest(unittest.TestCase):
         self.assertEqual(app.STATE_FILE.read_bytes(), baseline)
         self.assertEqual(self.writes, [])
 
+    def normal_reads(self):
+        self.stack.enter_context(patch.object(app, 'fetch_service_items', side_effect=lambda *_: copy.deepcopy(self.services)))
+        self.stack.enter_context(patch.object(app, 'fetch_venue_address', return_value=None))
+        self.stack.enter_context(patch.object(app, 'fetch_member_name', return_value=None))
+        self.stack.enter_context(patch.object(app, '_load_job_title_cache', return_value=({}, {})))
+        self.stack.enter_context(patch.object(app, 'find_job_by_service_name',
+            side_effect=lambda _, name, cache: repair.OPERATOR_JOB if name == 'Operator' else 'transport-job'))
+        self.stack.enter_context(patch.object(app, '_find_sibling_shift_ids', return_value=[repair.REPLACEMENT, repair.OTHER_OPERATOR]))
+
+    def test_release_real_normal_sync_preview_and_repeat(self):
+        plan = self.plan()
+        self.apply(plan)
+        self.normal_reads()
+        before = app.STATE_FILE.read_bytes()
+        with patch.object(app, 'update_shifts', REAL_UPDATE):
+            result = repair.release_hold(self.client, self.state, plan, repair.digest(plan))
+            self.assertEqual(result['status'], 'release_ready')
+            self.assertEqual(app.STATE_FILE.read_bytes(), before)
+            result = repair.release_hold(self.client, self.state, plan, repair.digest(plan), release=True)
+            self.assertTrue(result['holdReleased'])
+            self.assertNotIn('4071', app._load_state()['opportunity_holds'])
+            repair.release_hold(self.client, self.state, plan, repair.digest(plan), release=True)
+        self.assertEqual(len(self.writes), 12)
+        self.assertFalse(app._preview_state_writes.get())
+
+    def test_release_blocks_unintended_normal_update_and_keeps_disk_held(self):
+        plan = self.plan()
+        self.apply(plan)
+        self.normal_reads()
+        before = app.STATE_FILE.read_bytes()
+        with patch.object(app, 'get_job_color', return_value='#different'), patch.object(app, 'update_shifts', REAL_UPDATE):
+            with self.assertRaises(app.RecoveryRequired):
+                repair.release_hold(self.client, self.state, plan, repair.digest(plan), release=True)
+        self.assertEqual(app.STATE_FILE.read_bytes(), before)
+        self.assertFalse(app._preview_state_writes.get())
+        self.assertEqual(len(self.writes), 12)
+
+    def test_release_drift_and_pending_intent_block(self):
+        plan = self.plan()
+        self.apply(plan)
+        self.normal_reads()
+        original = copy.deepcopy(self.state)
+        before = app.STATE_FILE.read_bytes()
+        for change in ('pending', 'operator', 'deleted', 'notes', 'mapping'):
+            with self.subTest(change=change):
+                rows = copy.deepcopy(self.rows)
+                if change == 'pending': self.state['repair_journals'][repair.JOURNAL_KEY]['intent'] = self.deletes[0]
+                if change == 'operator': self.rows[repair.OTHER_OPERATOR]['assignedUserIds'] = [1]
+                if change == 'deleted': self.rows[self.deletes[0]] = {'id': self.deletes[0]}
+                if change == 'notes': self.rows[repair.RETAIN['125886'][0]]['notes'].append({'html': 'new manual note'})
+                if change == 'mapping': self.state['shifts']['126320']['shiftIds'] = [repair.REPLACEMENT]
+                with self.assertRaises(app.RecoveryRequired):
+                    repair.release_hold(self.client, self.state, plan, repair.digest(plan), release=True)
+                self.assertEqual(app.STATE_FILE.read_bytes(), before)
+                self.rows, self.state = rows, copy.deepcopy(original)
+
+    def test_later_normal_time_edits_replace_owned_arrival_and_preserve_manual_notes(self):
+        plan = self.plan()
+        self.apply(plan)
+        self.normal_reads()
+        repair.release_hold(self.client, self.state, plan, repair.digest(plan), release=True)
+        sid = repair.RETAIN['125886'][0]
+        manual = '<p>Manual crew instruction: keep exactly</p>'
+        def update_normal(_, payloads):
+            for payload in payloads:
+                self.rows[payload['shiftId']].update({k: v for k, v in payload.items() if k != 'shiftId'})
+            return [copy.deepcopy(self.rows[p['shiftId']]) for p in payloads]
+        for hour in (9, 10):
+            timestamp = f'2026-10-26T{hour:02d}:00:00+08:00'
+            self.services[0].update(starts_at=timestamp, ends_at=timestamp)
+            with patch.object(app, 'update_shifts', side_effect=update_normal), patch.object(app, 'notify_ops'):
+                result = app.sync_opportunity(self.client, 4071, self.state)
+            self.assertEqual(result['updated_count'], 1)
+            notes = app._note_html(self.rows[sid])
+            self.assertEqual(notes.count('On site at '), 1)
+            self.assertIn(f'On site at {hour}:00am sharp', notes)
+            self.assertIn(manual, notes)
+            self.assertEqual(self.rows[sid]['assignedUserIds'], [77])
+            self.assertTrue(self.rows[sid]['isPublished'])
+
     def test_hold_aware_degraded_readiness_allows_read_only_plan(self):
         baseline = app.STATE_FILE.read_bytes()
         client = app.httpx.Client(transport=app.httpx.MockTransport(
-            lambda _: app.httpx.Response(503, json={'opportunity_hold_policy_version': 1})))
+            lambda _: app.httpx.Response(503, json={'opportunity_hold_policy_version': 1,
+                                                  'sandalford_repair_policy_version': 1})))
         with patch.object(repair, 'RepairClient', return_value=client):
             report = repair.run()
         self.assertEqual(report['reviewDigest'], repair.digest(report['plan']))
         self.assertEqual(app.STATE_FILE.read_bytes(), baseline)
+        self.assertEqual(self.writes, [])
+
+    def test_old_hold_only_poller_cannot_release_or_apply_new_notes(self):
+        client = app.httpx.Client(transport=app.httpx.MockTransport(
+            lambda _: app.httpx.Response(503, json={'opportunity_hold_policy_version': 1})))
+        with patch.object(repair, 'RepairClient', return_value=client):
+            with self.assertRaises(app.RecoveryRequired): repair.run()
+        self.assertEqual(self.writes, [])
+
+    def test_existing_unowned_arrival_cannot_silently_be_adopted(self):
+        plan = self.plan()
+        op = next(op for op in plan['operations'] if op['id'] == repair.RETAIN['125886'][0])
+        note = op['payload']['notes'][-1]['html'].replace(' data-rms-bridge-arrival="1"', '')
+        self.rows[op['id']]['notes'].append({'html': note})
+        with self.assertRaises(app.RecoveryRequired): self.plan()
         self.assertEqual(self.writes, [])
 
 
