@@ -178,6 +178,7 @@ MAX_SHIFT_SECONDS = 24 * 60 * 60  # Connecteam: a shift can't exceed 24h.
 # The recovery CLI must not run against a poller that can undo its mappings or
 # ignore its validation quarantine. Bump only with a reviewed policy change.
 ITEM_RECOVERY_POLICY_VERSION = 1
+OPPORTUNITY_HOLD_POLICY_VERSION = 1
 
 # A Service line item spanning more than one calendar day becomes one shift
 # PER Australia/Perth calendar day it touches (see _split_into_daily_segments)
@@ -279,6 +280,7 @@ def _load_state() -> dict[str, Any]:
     data.setdefault("pending_creates", {})
     data.setdefault("retry_opportunities", {})
     data.setdefault("exceptions", {})
+    _opportunity_hold(data, None)  # Validate durable holds before any caller uses state.
     for entry in data["shifts"].values():
         if "shiftId" in entry:
             entry["shiftIds"] = [entry.pop("shiftId")]
@@ -298,6 +300,21 @@ def _sync_guard():
 
 def _record_exception(state, opportunity_id, message):
     state.setdefault("exceptions", {})[str(opportunity_id)] = {"message": message, "at": int(time.time())}
+
+
+def _opportunity_hold(state, opportunity_id):
+    """Fail closed on malformed hold metadata; exceptions are not holds."""
+    holds = state.get("opportunity_holds", {})
+    if not isinstance(holds, dict) or any(
+        not isinstance(key, str) or not key.isdecimal() or str(int(key)) != key
+        or not isinstance(value, dict) or not isinstance(value.get("reason"), str)
+        or not value["reason"].strip()
+        for key, value in holds.items()
+    ):
+        raise RecoveryRequired("Invalid durable opportunity hold metadata")
+    if str(opportunity_id) in holds:
+        return {"status": "held", "reason": "durable opportunity repair hold"}
+    return None
 
 
 
@@ -978,6 +995,11 @@ def _cleanup_shift_keys(
     opportunity (every caller scopes it that way), so the
     published-deletion notification is batched into ONE Chat message
     rather than one per shift."""
+    if state is None and opportunity_id == 4071:
+        raise RecoveryRequired("4071 cleanup requires authoritative hold state")
+    if state is not None and (held := _opportunity_hold(state, opportunity_id)):
+        return {**held, "tracked_shifts": 0, "deleted_count": 0,
+                "deleted_published_count": 0, "already_gone_count": 0}
     job_id_to_title = {v: k for k, v in job_title_cache.get("by_title", {}).items()}
 
     deleted = 0
@@ -1052,6 +1074,8 @@ def cleanup_ineligible_opportunity(
     deleted outright. All shifts tracked for it are torn down via
     _cleanup_shift_keys (deleted outright, draft or published; ops notified
     afterwards for anything that was published)."""
+    if held := _opportunity_hold(state, opportunity_id):
+        return held
     shifts_state: dict[str, Any] = state["shifts"]
     keys = [k for k, v in shifts_state.items() if v.get("opportunityId") == opportunity_id]
     if not keys:
@@ -1122,6 +1146,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
     Safe to call repeatedly for the same opportunity — matches existing
     shifts by opportunity_item ID and only sends an update when something
     actually changed."""
+    if held := _opportunity_hold(state, opportunity_id):
+        return held
     # Explicit rollout exclusion, before pending-create reconciliation or cleanup.
     if opportunity_id == 3950:
         return {"status": "held", "reason": "Production Management 3950 excluded from rollout"}
@@ -1685,6 +1711,8 @@ def sync_opportunity(client: httpx.Client, opportunity_id: int, state: dict[str,
 
 def _sync_and_checkpoint(client, opportunity_id, state):
     """Never let advancing the poll cursor lose a failed opportunity."""
+    if held := _opportunity_hold(state, opportunity_id):
+        return held
     key = str(opportunity_id)
     retry = state.setdefault("retry_opportunities", {})
     retry[key] = {"attempted_at": time.time()}
@@ -1830,12 +1858,15 @@ async def readyz():
         return JSONResponse({"status": "state-recovery-required"}, status_code=503)
     pending = len(state.get("pending_creates", {}))
     retries = len(state.get("retry_opportunities", {}))
+    holds = len(state.get("opportunity_holds", {}))
     last_poll = state.get("last_poll_completed_at")
     stale = ENABLE_SCHEDULER and (last_poll is None or time.time() - last_poll > max(900, 3 * POLL_INTERVAL_SECONDS))
-    return JSONResponse({"status": "degraded" if pending or retries or stale else "ok",
+    return JSONResponse({"status": "degraded" if pending or retries or holds or stale else "ok",
                          "item_recovery_policy_version": ITEM_RECOVERY_POLICY_VERSION,
+                         "opportunity_hold_policy_version": OPPORTUNITY_HOLD_POLICY_VERSION,
+                         "opportunity_holds": holds,
                          "pending_creates": pending, "retry_opportunities": retries,
                          "exceptions": len(state.get("exceptions", {})),
                          "reconciliation_mode": "report_only",
                          "reconciliation_attention": sum(bool(r.get("issues")) for r in state.get("reconciliation_reports", {}).values()),
-                         "last_poll_completed_at": last_poll}, status_code=503 if pending or retries or stale else 200)
+                         "last_poll_completed_at": last_poll}, status_code=503 if pending or retries or holds or stale else 200)
