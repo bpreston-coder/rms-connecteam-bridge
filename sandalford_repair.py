@@ -17,6 +17,7 @@ from pathlib import Path
 import app
 import recovery_support
 from bridge_safety import RecoveryRequired
+from repair_notes import arrival_variants, visible_arrival_html
 
 OPPORTUNITY = 4071
 ORDER = '100004056'
@@ -213,12 +214,12 @@ def build_plan(client, state):
         notes = copy.deepcopy(row.get('notes'))
         require(isinstance(notes, list) and all(isinstance(n, dict) and isinstance(n.get('html'), str) for n in notes),
                 'Canonical notes cannot be safely preserved')
-        owned_arrival = f'<p data-rms-bridge-arrival="1">{arrival}</p>'
+        owned_arrival = visible_arrival_html(key, arrival)
         require('On site at ' not in app._note_html(row) or
                 (owned_arrival in app._note_html(row) and app._note_html(row).count('On site at ') == 1),
                 'Existing unowned or conflicting arrival note requires review')
         if arrival not in app._note_html(row):
-            notes.append({'type': 'html', 'html': f'<p data-rms-bridge-arrival="1">{arrival}</p>'})
+            notes.append({'type': 'html', 'html': owned_arrival})
         payload = {'shiftId': sid, 'startTime': start, 'endTime': start + 60, 'notes': notes}
         after = {**stable(row), 'startTime': start, 'endTime': start + 60, 'notes': notes}
         operations.insert(0, {'kind': 'update', 'id': sid, 'sourceKey': owners(state, sid)[0],
@@ -253,7 +254,68 @@ def verify_operators(client, plan):
         require(stable(app.get_shift(client, sid)) == expected, 'Operator changed since review')
 
 
-def apply_plan(client, state, plan, review_digest):
+def review_amendment(client, state, plan, review_digest):
+    """GET-only evidence for the single known collection PUT stopped on sanitization."""
+    check_allowlist()
+    journal = state.get('repair_journals', {}).get(JOURNAL_KEY, {})
+    collection_id = RETAIN['125887'][0]
+    require(digest(plan) == review_digest and journal.get('digest') == review_digest
+            and journal.get('plan') == plan, 'Original manifest/journal mismatch')
+    require(journal.get('status') == 'in_progress' and journal.get('confirmed') == []
+            and journal.get('intent') == collection_id and 'amendment' not in journal,
+            'Amendment supports only the first unconfirmed collection intent')
+    hold = state.get('opportunity_holds', {}).get(str(OPPORTUNITY), {})
+    require(hold.get('journal') == JOURNAL_KEY and hold.get('digest') == review_digest,
+            'Original durable hold changed')
+    require(scope(state) == plan['beforeScope'], 'Original state mapping changed')
+    check_ownership(state, plan)
+    require(source_snapshot(client) == plan['source'], 'Source changed before amendment')
+    verify_operators(client, plan)
+    operations = copy.deepcopy(plan['operations'])
+    require([op['id'] for op in operations[:2]] == [collection_id, RETAIN['125886'][0]]
+            and all(op['kind'] == 'delete' for op in operations[2:]), 'Original operation order differs')
+    for op in operations:
+        live = stable(app.get_shift(client, op['id']))
+        if op['id'] == collection_id:
+            variants = arrival_variants(op)
+            require(bool(variants), 'Original collection appended paragraph is not proven')
+            sanitized = copy.deepcopy(op['after'])
+            sanitized['notes'][-1]['html'] = variants[1]
+            require(live == sanitized, 'Collection differs beyond the single stripped attribute')
+            op['before'] = live
+        else:
+            require(live == op['before'], 'An untouched destination changed before amendment')
+        if op['kind'] == 'update':
+            variants = arrival_variants(next(original for original in plan['operations'] if original['id'] == op['id']))
+            require(bool(variants), 'Original generated arrival paragraph is not proven')
+            key = op['sourceKey'].split(':')[0]
+            text = variants[1][3:-4]
+            op['after']['notes'][-1]['html'] = visible_arrival_html(key, text)
+            op['payload']['notes'] = copy.deepcopy(op['after']['notes'])
+            if op['id'] == collection_id:
+                # Its times already changed successfully. Only replace the proven
+                # generated paragraph; preserve every original/manual note exactly.
+                op['payload'] = {'shiftId': collection_id, 'notes': copy.deepcopy(op['after']['notes'])}
+    amendment = {'version': 1, 'originalDigest': review_digest,
+                 'originalJournal': copy.deepcopy(journal),
+                 'reconciledIntent': collection_id, 'operations': operations}
+    return {'amendmentDigest': digest(amendment), 'amendment': amendment}
+
+
+def effective_operations(journal, plan):
+    amendment = journal.get('amendment')
+    if amendment is None:
+        require(not any(arrival_variants(op) for op in plan['operations']),
+                'Legacy attribute-based plan requires reviewed amendment')
+        return plan['operations']
+    require(digest(amendment) == journal.get('amendmentDigest')
+            and amendment.get('originalDigest') == journal.get('digest')
+            and amendment['originalJournal']['plan'] == plan,
+            'Amendment integrity check failed')
+    return amendment['operations']
+
+
+def apply_plan(client, state, plan, review_digest, *, amendment_digest=None):
     """Caller holds production lock. Journal persists before each outbound write."""
     check_allowlist()
     require(digest(plan) == review_digest, 'Review digest differs')
@@ -273,6 +335,18 @@ def apply_plan(client, state, plan, review_digest):
         app._save_state(state)
     require(journal.get('digest') == review_digest and journal.get('plan') == plan,
             'Journal does not match reviewed plan')
+    if amendment_digest is not None and 'amendment' not in journal:
+        report = review_amendment(client, state, plan, review_digest)
+        require(report['amendmentDigest'] == amendment_digest, 'Amendment review digest differs')
+        # Preserve original journal verbatim inside amendment and original plan /
+        # digest in place. Reconciled old PUT is never resent as a time update.
+        journal['amendment'] = report['amendment']
+        journal['amendmentDigest'] = amendment_digest
+        journal['intent'] = None
+        app._save_state(state)
+    if 'amendment' in journal:
+        require(amendment_digest == journal['amendmentDigest'], 'Resume requires reviewed amendment digest')
+    operations = effective_operations(journal, plan)
     hold = state.get('opportunity_holds', {}).get(str(OPPORTUNITY), {})
     require(hold.get('journal') == JOURNAL_KEY and hold.get('digest') == review_digest,
             'Repair hold missing or changed')
@@ -282,15 +356,26 @@ def apply_plan(client, state, plan, review_digest):
     require(source_snapshot(client) == plan['source'], 'Source changed since review')
     verify_operators(client, plan)
     # Check ALL rows before resuming, not merely the next operation.
-    for op in plan['operations']:
+    for op in operations:
         live = stable(app.get_shift(client, op['id']))
-        allowed = [op['after']] if op['id'] in journal['confirmed'] else [op['before']]
-        if journal['intent'] == op['id']:
-            allowed.append(op['after'])
-        require(live in allowed, 'Destination drift outside journaled operation')
-    for op in plan['operations']:
+        after_allowed = op['id'] in journal['confirmed'] or journal['intent'] == op['id']
+        before_allowed = op['id'] not in journal['confirmed']
+        require((before_allowed and live == op['before']) or
+                (after_allowed and live == op['after']), 'Destination drift outside journaled operation')
+    # Additive verifier-policy checkpoint; preserve the original plan, digest,
+    # intent and confirmations. A crash before this save performs no writes.
+    require(journal.get('arrivalReadbackPolicy', 1) in (1, 2), 'Unknown arrival read-back policy')
+    if journal.get('arrivalReadbackPolicy') != 2:
+        journal['arrivalReadbackPolicy'] = 2
+        app._save_state(state)
+    for op in operations:
         if op['id'] in journal['confirmed']:
             continue
+        if op['kind'] == 'delete':
+            for canonical in operations[:2]:
+                require(canonical['kind'] == 'update' and canonical['id'] in journal['confirmed']
+                        and stable(app.get_shift(client, canonical['id'])) == canonical['after'],
+                        'Both canonical read-backs must remain verified before deletion')
         check_ownership(state, plan)
         live = stable(app.get_shift(client, op['id']))
         require(live == op['before'] or (journal['intent'] == op['id'] and live == op['after']),
@@ -313,7 +398,7 @@ def apply_plan(client, state, plan, review_digest):
         app._save_state(state)
     require(source_snapshot(client) == plan['source'], 'Source changed during repair')
     verify_operators(client, plan)
-    for op in plan['operations']:
+    for op in operations:
         require(stable(app.get_shift(client, op['id'])) == op['after'], 'Final destination read-back differs')
     # Atomic state migration only after every remote operation is confirmed.
     require(scope(state) == plan['afterScope' if final else 'beforeScope'], 'State changed before migration')
@@ -376,7 +461,9 @@ def release_hold(client, state, plan, review_digest, *, release=False):
     journal = state.get('repair_journals', {}).get(JOURNAL_KEY, {})
     require(digest(plan) == review_digest and journal.get('digest') == review_digest
             and journal.get('plan') == plan, 'Release requires exact journaled review digest')
+    operations = effective_operations(journal, plan)
     require(journal.get('status') in {'verified_held', 'released'} and journal.get('intent') is None
+            and journal.get('arrivalReadbackPolicy') == 2
             and len(journal.get('confirmed', [])) == len(plan['operations'])
             and set(journal['confirmed']) == {op['id'] for op in plan['operations']},
             'Repair actions are not fully confirmed')
@@ -390,13 +477,13 @@ def release_hold(client, state, plan, review_digest, *, release=False):
     check_ownership(state, plan, final=True)
     require(source_snapshot(client) == plan['source'], 'Source changed since repair')
     verify_operators(client, plan)
-    for op in plan['operations']:
+    for op in operations:
         require(stable(app.get_shift(client, op['id'])) == op['after'], 'Release destination verification failed')
     normal_sync_converges(client, state)
     # The preview can be long; recheck source and exact destinations afterwards.
     require(source_snapshot(client) == plan['source'], 'Source changed during convergence check')
     verify_operators(client, plan)
-    for op in plan['operations']:
+    for op in operations:
         require(stable(app.get_shift(client, op['id'])) == op['after'], 'Destination changed during convergence check')
     if release and not already_released:
         # One durable atomic save: a crash leaves either verified_held or released.
@@ -410,9 +497,10 @@ def release_hold(client, state, plan, review_digest, *, release=False):
             'reviewDigest': review_digest, 'holdReleased': bool(release or already_released)}
 
 
-def run(*, plan=None, review_digest=None, check_release=False, release=False):
+def run(*, plan=None, review_digest=None, check_release=False, release=False,
+        check_amendment=False, amendment_digest=None):
     require(getattr(app, 'OPPORTUNITY_HOLD_POLICY_VERSION', None) == 1, 'Hold-aware poller code required')
-    require(getattr(app, 'SANDALFORD_REPAIR_POLICY_VERSION', None) == 1, 'Owned-note convergence policy required')
+    require(getattr(app, 'SANDALFORD_REPAIR_POLICY_VERSION', None) == 2, 'Sanitizer-safe owned-note policy required')
     with app._sync_guard():
         require(app.STATE_FILE.is_file(), 'Existing production state required')
         state = app._load_state()
@@ -422,15 +510,17 @@ def run(*, plan=None, review_digest=None, check_release=False, release=False):
             port = int(os.environ.get('PORT', '10000'))
             readiness = client.get(f'http://127.0.0.1:{port}/readyz').json()
             require(readiness.get('opportunity_hold_policy_version') == 1
-                    and readiness.get('sandalford_repair_policy_version') == 1,
+                    and readiness.get('sandalford_repair_policy_version') == 2,
                     'Running poller has not confirmed hold and owned-note convergence support')
             if review_digest is None:
                 manifest = build_plan(client, state)
                 return {'reviewDigest': digest(manifest), 'plan': manifest}
             require(isinstance(plan, dict), 'Exact reviewed plan required')
+            if check_amendment:
+                return review_amendment(client, state, plan, review_digest)
             if check_release or release:
                 return release_hold(client, state, plan, review_digest, release=release)
-            return apply_plan(client, state, plan, review_digest)
+            return apply_plan(client, state, plan, review_digest, amendment_digest=amendment_digest)
 
 
 def main():
@@ -439,13 +529,19 @@ def main():
     parser.add_argument('--apply-digest')
     parser.add_argument('--check-release', action='store_true', help='GET-only convergence review; retain hold')
     parser.add_argument('--release-hold', action='store_true', help='Reverify convergence and atomically release hold')
+    parser.add_argument('--review-amendment', action='store_true', help='GET-only review of the known sanitized collection intent')
+    parser.add_argument('--amendment-digest', help='Apply/resume only the exact reviewed journal amendment')
     args = parser.parse_args()
     require(bool(args.plan_file) == bool(args.apply_digest), 'Apply requires both plan file and digest')
     require(not (args.check_release and args.release_hold), 'Choose check-release or release-hold')
+    require(not args.review_amendment or not (args.check_release or args.release_hold or args.amendment_digest),
+            'Amendment review cannot be combined with apply/release')
+    require(not (args.review_amendment or args.amendment_digest) or bool(args.apply_digest), 'Amendment needs original plan/digest')
     require(not (args.check_release or args.release_hold) or bool(args.apply_digest), 'Release needs reviewed plan and digest')
     manifest = json.loads(args.plan_file.read_text())['plan'] if args.plan_file else None
     print(json.dumps(run(plan=manifest, review_digest=args.apply_digest,
-                         check_release=args.check_release, release=args.release_hold), indent=2))
+                         check_release=args.check_release, release=args.release_hold,
+                         check_amendment=args.review_amendment, amendment_digest=args.amendment_digest), indent=2))
 
 
 if __name__ == '__main__':

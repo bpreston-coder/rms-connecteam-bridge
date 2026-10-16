@@ -108,8 +108,8 @@ class RepairTest(unittest.TestCase):
     def plan(self):
         return repair.build_plan(self.client, self.state)
 
-    def apply(self, plan):
-        return repair.apply_plan(self.client, self.state, plan, repair.digest(plan))
+    def apply(self, plan, **kwargs):
+        return repair.apply_plan(self.client, self.state, plan, repair.digest(plan), **kwargs)
 
     def test_no_deletion_allowlist_fails_closed(self):
         with patch.object(repair, 'DELETE_IDS', ()), self.assertRaises(app.RecoveryRequired):
@@ -340,7 +340,7 @@ class RepairTest(unittest.TestCase):
         baseline = app.STATE_FILE.read_bytes()
         client = app.httpx.Client(transport=app.httpx.MockTransport(
             lambda _: app.httpx.Response(503, json={'opportunity_hold_policy_version': 1,
-                                                  'sandalford_repair_policy_version': 1})))
+                                                  'sandalford_repair_policy_version': 2})))
         with patch.object(repair, 'RepairClient', return_value=client):
             report = repair.run()
         self.assertEqual(report['reviewDigest'], repair.digest(report['plan']))
@@ -357,10 +357,91 @@ class RepairTest(unittest.TestCase):
     def test_existing_unowned_arrival_cannot_silently_be_adopted(self):
         plan = self.plan()
         op = next(op for op in plan['operations'] if op['id'] == repair.RETAIN['125886'][0])
-        note = op['payload']['notes'][-1]['html'].replace(' data-rms-bridge-arrival="1"', '')
+        note = op['payload']['notes'][-1]['html'].replace('Bridge arrival (opportunity item #125886): ', '')
         self.rows[op['id']]['notes'].append({'html': note})
         with self.assertRaises(app.RecoveryRequired): self.plan()
         self.assertEqual(self.writes, [])
+
+    def legacy_partial(self):
+        """Exact old-journal shape: first PUT succeeded except for stripped attribute."""
+        plan = self.plan()
+        for op in plan['operations']:
+            if op['kind'] != 'update':
+                continue
+            key = op['sourceKey'].split(':')[0]
+            html = op['after']['notes'][-1]['html'].replace(
+                f'<p>Bridge arrival (opportunity item #{key}): ', '<p data-rms-bridge-arrival="1">')
+            op['after']['notes'][-1]['html'] = html
+            op['payload']['notes'][-1]['html'] = html
+        collection = plan['operations'][0]
+        self.rows[collection['id']] = copy.deepcopy(collection['after'])
+        self.rows[collection['id']]['notes'][-1]['html'] = collection['after']['notes'][-1]['html'].replace(
+            ' data-rms-bridge-arrival="1"', '')
+        review_digest = repair.digest(plan)
+        journal = {'digest': review_digest, 'plan': copy.deepcopy(plan), 'confirmed': [],
+                   'intent': collection['id'], 'status': 'in_progress'}
+        self.state['repair_journals'] = {repair.JOURNAL_KEY: journal}
+        self.state['opportunity_holds'] = {'4071': {'reason': 'repair', 'journal': repair.JOURNAL_KEY,
+                                                 'digest': review_digest}}
+        app._save_state(self.state)
+        return plan, copy.deepcopy(journal)
+
+    def test_sanitized_intent_requires_amendment_preserves_original_and_no_time_replay(self):
+        plan, original = self.legacy_partial()
+        before_disk = app.STATE_FILE.read_bytes()
+        with self.assertRaises(app.RecoveryRequired): self.apply(plan)
+        report = repair.review_amendment(self.client, self.state, plan, repair.digest(plan))
+        self.assertEqual(app.STATE_FILE.read_bytes(), before_disk)
+        self.assertEqual(report['amendment']['originalJournal'], original)
+        self.assertEqual(set(report['amendment']['operations'][0]['payload']), {'shiftId', 'notes'})
+        with self.assertRaises(app.RecoveryRequired): self.apply(plan, amendment_digest='wrong')
+        self.assertEqual(app.STATE_FILE.read_bytes(), before_disk)
+        self.apply(plan, amendment_digest=report['amendmentDigest'])
+        journal = self.state['repair_journals'][repair.JOURNAL_KEY]
+        self.assertEqual(journal['plan'], original['plan'])
+        self.assertEqual(journal['digest'], original['digest'])
+        self.assertEqual(journal['amendment']['originalJournal'], original)
+        self.assertEqual(len(self.writes), 12)
+        self.assertEqual([kind for kind, _ in self.writes[:2]], ['update', 'update'])
+        self.normal_reads()
+        repair.release_hold(self.client, self.state, plan, repair.digest(plan), release=True)
+
+    def test_sanitized_text_or_manual_drift_is_not_equivalent(self):
+        plan, _ = self.legacy_partial()
+        sid = repair.RETAIN['125887'][0]
+        original = copy.deepcopy(self.rows[sid])
+        for change in ('arrival', 'manual', 'publication', 'assignment', 'type'):
+            self.rows[sid] = copy.deepcopy(original)
+            if change == 'arrival': self.rows[sid]['notes'][-1]['html'] = self.rows[sid]['notes'][-1]['html'].replace('2:00pm', '3:00pm')
+            if change == 'manual': self.rows[sid]['notes'][1]['html'] += ' altered'
+            if change == 'publication': self.rows[sid]['isPublished'] = True
+            if change == 'assignment': self.rows[sid]['assignedUserIds'] = [99]
+            if change == 'type': self.rows[sid]['notes'][-1]['type'] = 'text'
+            with self.subTest(change=change), self.assertRaises(app.RecoveryRequired):
+                repair.review_amendment(self.client, self.state, plan, repair.digest(plan))
+        self.assertEqual(self.writes, [])
+
+    def test_amendment_crash_resume_reconciles_note_put_without_retry(self):
+        plan, _ = self.legacy_partial()
+        report = repair.review_amendment(self.client, self.state, plan, repair.digest(plan))
+        def uncertain(client, payloads):
+            self.update(client, payloads)
+            raise app.httpx.ReadTimeout('offline committed PUT timeout')
+        with patch.object(app, 'update_shifts', side_effect=uncertain):
+            with self.assertRaises(app.httpx.ReadTimeout):
+                self.apply(plan, amendment_digest=report['amendmentDigest'])
+        self.state = app._load_state()
+        self.apply(plan, amendment_digest=report['amendmentDigest'])
+        collection = repair.RETAIN['125887'][0]
+        self.assertEqual(self.writes.count(('update', collection)), 1)
+        self.assertEqual(len(self.writes), 12)
+
+    def test_pre_amendment_policy_one_poller_is_rejected(self):
+        client = app.httpx.Client(transport=app.httpx.MockTransport(
+            lambda _: app.httpx.Response(503, json={'opportunity_hold_policy_version': 1,
+                                                  'sandalford_repair_policy_version': 1})))
+        with patch.object(repair, 'RepairClient', return_value=client):
+            with self.assertRaises(app.RecoveryRequired): repair.run()
 
 
 class NetworkGuardTest(unittest.TestCase):

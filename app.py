@@ -180,7 +180,7 @@ MAX_SHIFT_SECONDS = 24 * 60 * 60  # Connecteam: a shift can't exceed 24h.
 # ignore its validation quarantine. Bump only with a reviewed policy change.
 ITEM_RECOVERY_POLICY_VERSION = 1
 OPPORTUNITY_HOLD_POLICY_VERSION = 1
-SANDALFORD_REPAIR_POLICY_VERSION = 1
+SANDALFORD_REPAIR_POLICY_VERSION = 2
 
 # A Service line item spanning more than one calendar day becomes one shift
 # PER Australia/Perth calendar day it touches (see _split_into_daily_segments)
@@ -682,6 +682,9 @@ def _merge_owned_notes(live, generated):
         if "html" not in note:
             raise RecoveryRequired("Non-HTML manual notes present; preserve them for review")
         content = note["html"]
+        content = re.sub(r'<p>Bridge arrival \(opportunity item #[0-9]+\): '
+                         r'On site at (?:[1-9]|1[0-2]):[0-5][0-9](?:am|pm) sharp \(AWST\)\. '
+                         r'The one-minute slot represents arrival only, not work duration\.</p>', '', content)
         content = re.sub(r'<p data-rms-bridge-arrival="1">[^<]*</p>', '', content)
         if re.fullmatch(r"<p>Bridge identity: [a-f0-9]{32}</p>", content):
             continue

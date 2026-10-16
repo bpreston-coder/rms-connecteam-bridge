@@ -24,7 +24,7 @@ transport items, unpublished and unassigned.
 
 Before a future execution, deploy the reviewed hold-aware poller with separate
 authorization. `/readyz` must report both `opportunity_hold_policy_version: 1`
-and `sandalford_repair_policy_version: 1` (owned notes and convergence preview). The
+and `sandalford_repair_policy_version: 2` (sanitizer-safe notes and amendment support). The
 helper checks the running process at `127.0.0.1:$PORT` (default 10000), not just
 the staged Python module. Never stage the helper against the old process and
 assume it respects a hold. Do not restart during the ongoing Mac repair.
@@ -59,9 +59,42 @@ Future operator workflow, only after allowlist and deployment review:
    released. A failure retains the durable hold. This never removes the real
    hold temporarily to run normal sync. Subsequent source edits use ordinary sync.
 
-The appended arrival paragraph has an explicit bridge-owned HTML attribute.
-Later ordinary time edits remove that paragraph and regenerate the arrival note,
+The appended arrival paragraph uses the visible prefix
+`Bridge arrival (opportunity item #125886):` (or `#125887`). Later ordinary time
+edits remove only that exact generated paragraph and regenerate the arrival note,
 preserving manual text. Unowned pre-existing arrival text requires review.
+
+## Resume the first collection PUT stopped by HTML sanitization
+
+The original attribute-based manifest must not be regenerated, overwritten or
+silently re-digested. Keep the original plan file and original review digest.
+After separately approved deployment of policy 2:
+
+1. Add `--review-amendment` to the original plan-file/apply-digest arguments.
+   This performs GET-only checks. It requires the original in-progress journal,
+   empty confirmations, and the collection as its sole current intent. It proves
+   that collection matches the exact expected post-PUT row with only the known
+   `data-rms-bridge-arrival="1"` attribute removed from the single appended
+   paragraph. Every other field and all original/manual notes must match exactly.
+   Delivery, all ten deletion candidates, operators, source and state must still
+   match their reviewed preconditions.
+2. Review the returned amendment and its separate digest. The collection amendment
+   PUT contains only `shiftId` and `notes`; it replaces its proven generated
+   paragraph with the visible ownership prefix. It does not replay the time update.
+   Delivery uses the same visible prefix in its still-pending normal time update.
+3. Apply/resume using the original plan file and original digest plus
+   `--amendment-digest AMENDMENT_DIGEST`. The original plan/digest remain unchanged;
+   a full original-journal snapshot and the reviewed amendment are saved durably
+   before mutation. The old collection intent is recorded as reconciled. Later
+   interrupted amendment writes resume by strict exact-ID read-back, never broad
+   HTML normalization or blind retry. Both canonical read-backs must be confirmed
+   and still match immediately before every deletion.
+4. Use the ordinary check-release/release-hold steps with the original plan/digest.
+   They verify the journaled amendment's final rows. Release requires the new
+   running policy, ensuring future time edits replace the visible owned note.
+
+No other legacy journal shape is eligible for this amendment. Any meaningful text,
+manual content, assignment/publication, ownership or source drift retains the hold.
 
 Polling remains `POLL_INTERVAL_SECONDS=300`. Approved target 90 is deferred during
 repair and pending actual quota verification. Connecteam's published account-wide
