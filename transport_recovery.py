@@ -59,17 +59,18 @@ def _verify_live(row, desired, key, *, fresh_payload=None, identity=None):
             return result
         actual_fields = fields(row.get('customFields'))
         expected_fields = fields(fresh_payload['customFields'])
-        # Connecteam may omit this one empty optional text field on read-back.
+        # Connecteam may omit this one explicitly empty text field on read-back.
+        # This does not establish account-specific UI requiredness or omit it on write.
         # Never normalize null, whitespace, nonempty values, or any other field.
         if expected_fields.get('1353115') == '' and '1353115' not in actual_fields:
             actual_fields['1353115'] = ''
         if actual_fields != expected_fields:
             raise RecoveryRequired(f'Target {key}: fresh custom fields differ')
-        expected_location = fresh_payload['locationData']
+        expected_location = fresh_payload.get('locationData')
         actual_location = row.get('locationData') or {}
-        if actual_location.get('isReferencedToJob') is not False:
+        if actual_location and actual_location.get('isReferencedToJob') is not False:
             raise RecoveryRequired(f'Target {key}: fresh location reference differs')
-        if expected_location['gps'] is None:
+        if expected_location is None or expected_location['gps'] is None:
             location_matches = not actual_location.get('gps')
         else:
             location_matches = (actual_location.get('gps') or {}).get('address') == expected_location['gps']['address']
@@ -144,8 +145,12 @@ def plan_recovery(client, state, scan_start, scan_end):
                            isPublished=False, jobId=job_id, customFields=fields, notes=notes)
             if desired['color']:
                 payload['color'] = desired['color']
-            payload['locationData'] = {'isReferencedToJob': False,
-                                       'gps': {'address': address} if address else None}
+            # locationData is optional in the create API. Do not send a null
+            # gps override while investigating the reported literal "None" address.
+            # Read-back still rejects inherited/nonempty GPS for an absent source.
+            if address:
+                payload['locationData'] = {'isReferencedToJob': False,
+                                           'gps': {'address': address}}
             entries = {k: e for k, e in state['shifts'].items() if k.split(':')[0] == key}
             pending = state.get('pending_creates', {}).get(key)
             if any(k.split(':')[0] == key and k != key for k in state.get('pending_creates', {})):

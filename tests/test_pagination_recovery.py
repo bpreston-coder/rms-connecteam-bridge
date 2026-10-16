@@ -359,6 +359,24 @@ class RecoveryTest(unittest.TestCase):
                 field['value'] = 'required description'
         with self.assertRaises(app.RecoveryRequired): verify()
 
+    def test_no_source_address_omits_location_payload_but_rejects_fake_gps(self):
+        plan = self.dry()['plans'][0]
+        payload = copy.deepcopy(plan['payload'])
+        self.assertNotIn('locationData', payload)
+        row = {**copy.deepcopy(payload), 'id': 'fresh', 'assignedUserIds': []}
+        row['notes'].append({'html': '<p>Bridge identity: example</p>'})
+        def verify():
+            recovery._verify_live(row, plan['desired'], str(plan['itemId']),
+                fresh_payload=payload, identity='Bridge identity: example')
+        for empty in (None, {}, {'isReferencedToJob': False, 'gps': None}):
+            row['locationData'] = empty
+            verify()
+        for invalid in ({'isReferencedToJob': False, 'gps': {'address': 'None'}},
+                        {'isReferencedToJob': False, 'gps': {'address': 'Actual venue'}},
+                        {'isReferencedToJob': True, 'gps': None}):
+            row['locationData'] = invalid
+            with self.subTest(location=invalid), self.assertRaises(app.RecoveryRequired): verify()
+
     def test_scan_bounds_required_and_part_of_review_digest(self):
         with patch.object(app, 'ITEM_RECOVERY_POLICY_VERSION', None):
             with self.assertRaises(app.RecoveryRequired): self.dry()
