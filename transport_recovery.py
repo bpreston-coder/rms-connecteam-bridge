@@ -48,13 +48,22 @@ def _verify_live(row, desired, key, *, fresh_payload=None, identity=None):
         if row.get('isPublished') is not False or row.get('assignedUserIds') != []:
             raise RecoveryRequired(f'Target {key}: fresh create is not an unassigned draft')
         def fields(value):
-            if not isinstance(value, list):
+            if not isinstance(value, list) or any(
+                not isinstance(f, dict) or 'customFieldId' not in f or 'value' not in f
+                for f in value
+            ):
                 raise RecoveryRequired(f'Target {key}: missing custom-field read-back')
             result = {str(f['customFieldId']): f.get('value') for f in value}
             if len(result) != len(value):
                 raise RecoveryRequired(f'Target {key}: duplicate custom-field read-back')
             return result
-        if fields(row.get('customFields')) != fields(fresh_payload['customFields']):
+        actual_fields = fields(row.get('customFields'))
+        expected_fields = fields(fresh_payload['customFields'])
+        # Connecteam may omit this one empty optional text field on read-back.
+        # Never normalize null, whitespace, nonempty values, or any other field.
+        if expected_fields.get('1353115') == '' and '1353115' not in actual_fields:
+            actual_fields['1353115'] = ''
+        if actual_fields != expected_fields:
             raise RecoveryRequired(f'Target {key}: fresh custom fields differ')
         expected_location = fresh_payload['locationData']
         actual_location = row.get('locationData') or {}

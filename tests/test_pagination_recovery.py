@@ -332,6 +332,33 @@ class RecoveryTest(unittest.TestCase):
         with self.assertRaises(app.RecoveryRequired): self.dry()
         self.assertFalse(self.posts)
 
+    def test_only_omitted_empty_1353115_is_equivalent(self):
+        plan = self.dry()['plans'][0]
+        payload = copy.deepcopy(plan['payload'])
+        for field in payload['customFields']:
+            if str(field['customFieldId']) == '1353115':
+                field['value'] = ''
+        row = {**copy.deepcopy(payload), 'id': 'fresh', 'assignedUserIds': []}
+        row['notes'].append({'html': '<p>Bridge identity: example</p>'})
+        row['customFields'] = [f for f in row['customFields'] if str(f['customFieldId']) != '1353115']
+        def verify():
+            recovery._verify_live(row, plan['desired'], str(plan['itemId']),
+                fresh_payload=payload, identity='Bridge identity: example')
+        verify()
+        good = copy.deepcopy(row['customFields'])
+        for fields in (good + [{'customFieldId': 1353115, 'value': None}],
+                       good + [{'customFieldId': 1353115, 'value': ' '}],
+                       good + [{'customFieldId': 1353115, 'value': 'manual'}],
+                       good + [{'customFieldId': 1353115}],
+                       good + [good[0]], good[1:], good + [None]):
+            row['customFields'] = fields
+            with self.subTest(fields=fields), self.assertRaises(app.RecoveryRequired): verify()
+        row['customFields'] = good
+        for field in payload['customFields']:
+            if str(field['customFieldId']) == '1353115':
+                field['value'] = 'required description'
+        with self.assertRaises(app.RecoveryRequired): verify()
+
     def test_scan_bounds_required_and_part_of_review_digest(self):
         with patch.object(app, 'ITEM_RECOVERY_POLICY_VERSION', None):
             with self.assertRaises(app.RecoveryRequired): self.dry()
