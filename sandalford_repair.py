@@ -1,7 +1,7 @@
 """Offline-reviewed 4071 repair. Leaves a durable hold; never invokes sync.
 
-The ten deletion IDs MUST be filled from the approved report and code-reviewed.
-An empty allowlist deliberately disables planning/apply. No date-based guessing.
+The ten deletion IDs and their source items are frozen from the approved report.
+Publication and production execution remain separately gated. No date-based guessing.
 Run a dry run on the production host, review its manifest, then pass that exact
 JSON file and digest to apply. The hold-aware poller must already be deployed.
 """
@@ -28,7 +28,19 @@ OTHER_OPERATOR = '6acf28b67e4764842fac60dc'
 IDENTITY = 'Bridge identity: 32b6440a4326421ba0742b7427f27d52'
 RETAIN = {'125886': ('6acf25b8828980cd742a5f3d', '2026-10-26T08:00:00+08:00'),
           '125887': ('6acf25bc828980cd742a5f41', '2026-10-28T14:00:00+08:00')}
-DELETE_IDS: tuple[str, ...] = ()  # Pending exact ten-ID manifest from approved Mac report.
+DELETE_BY_ITEM = {
+    '125886': (
+        '6acf25b627228e4c71521dcb', '6acf25b678aae02b9ecde568',
+        '6acf25b778aae02b9ecde56a', '6acf25b82ecda2de8bd6b0ac',
+        '6acf25b90991f240c218d535',
+    ),
+    '125887': (
+        '6acf25ba828980cd742a5f3f', '6acf25ba78aae02b9ecde56c',
+        '6acf25bb0991f240c218d537', '6acf25bb78aae02b9ecde56e',
+        '6acf25bc0991f240c218d539',
+    ),
+}
+DELETE_IDS = tuple(sid for ids in DELETE_BY_ITEM.values() for sid in ids)
 JOURNAL_KEY = 'sandalford_4071_v1'
 
 
@@ -44,7 +56,11 @@ def require(condition, message):
 def check_allowlist():
     protected = {MISSING, REPLACEMENT, OTHER_OPERATOR, *(v[0] for v in RETAIN.values())}
     require(len(DELETE_IDS) == 10 and len(set(DELETE_IDS)) == 10
-            and not protected.intersection(DELETE_IDS), 'Reviewed exact ten deletion IDs required')
+            and not protected.intersection(DELETE_IDS)
+            and set(DELETE_BY_ITEM) == set(RETAIN)
+            and all(len(ids) == 5 for ids in DELETE_BY_ITEM.values())
+            and tuple(sid for ids in DELETE_BY_ITEM.values() for sid in ids) == DELETE_IDS,
+            'Reviewed exact ten deletion IDs and source items required')
 
 
 def scope(state):
@@ -176,7 +192,8 @@ def build_plan(client, state):
                 'Canonical transport publication/assignment differs')
         for k in keys:
             for old_id in before['shifts'][k].get('shiftIds', []):
-                require(old_id == sid or old_id in DELETE_IDS, 'Unexpected transport destination in mapping')
+                require(old_id == sid or old_id in DELETE_BY_ITEM[key],
+                        'Unexpected transport destination/source item in mapping')
                 if old_id == sid:
                     continue
                 require(owners(state, old_id) == [k], 'Deletion ownership differs')
@@ -272,6 +289,7 @@ def apply_plan(client, state, plan, review_digest):
     for op in plan['operations']:
         if op['id'] in journal['confirmed']:
             continue
+        check_ownership(state, plan)
         live = stable(app.get_shift(client, op['id']))
         require(live == op['before'] or (journal['intent'] == op['id'] and live == op['after']),
                 'Destination changed immediately before operation')

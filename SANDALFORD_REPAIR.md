@@ -1,9 +1,13 @@
 # 4071 coordinated repair — review stage only
 
-No production execution is authorized by this document. The helper currently
-refuses to plan or apply because `DELETE_IDS` is empty. Obtain the ten exact IDs
-from the approved Mac report, insert them into the code allowlist and independently
-review the resulting manifest. Never infer them from a date range.
+No production execution is authorized by this document. The exact
+ten approved IDs are frozen in `DELETE_BY_ITEM`, five each for delivery `125886`
+and collection `125887`. Approval cannot transfer between source items. The two
+retained transport IDs and all operator IDs are explicitly excluded. Independently
+review the resulting live manifest before any future apply. Never infer targets
+from a date range. The user separately approved saving only the dedicated repair
+feature branch to the existing `bpreston-coder/rms-connecteam-bridge` repository
+for review. Main merge and deployment still require separate authorization.
 
 The only remote writes permitted are PUTs to the retained delivery and collection
 and DELETEs to those ten IDs. No creates, notifications, source changes, operator

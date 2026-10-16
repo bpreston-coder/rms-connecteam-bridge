@@ -42,8 +42,7 @@ class RepairTest(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.temp = self.stack.enter_context(tempfile.TemporaryDirectory())
         self.stack.enter_context(patch.object(app, 'STATE_FILE', Path(self.temp) / 'state.json'))
-        self.deletes = tuple(f'offline-delete-{i}' for i in range(10))
-        self.stack.enter_context(patch.object(repair, 'DELETE_IDS', self.deletes))
+        self.deletes = repair.DELETE_IDS
         self.state = {'shifts': {}, 'exceptions': {'4071': {'message': 'prior'}},
                       'retry_opportunities': {'4071': {'error': 'prior'}}, 'pending_creates': {}}
         self.rows = {}
@@ -114,6 +113,53 @@ class RepairTest(unittest.TestCase):
         with patch.object(repair, 'DELETE_IDS', ()), self.assertRaises(app.RecoveryRequired):
             self.plan()
         self.assertEqual(self.writes, [])
+
+    def test_approved_ids_are_bound_to_exact_source_items(self):
+        self.assertEqual(repair.DELETE_BY_ITEM, {
+            '125886': ('6acf25b627228e4c71521dcb', '6acf25b678aae02b9ecde568',
+                       '6acf25b778aae02b9ecde56a', '6acf25b82ecda2de8bd6b0ac',
+                       '6acf25b90991f240c218d535'),
+            '125887': ('6acf25ba828980cd742a5f3f', '6acf25ba78aae02b9ecde56c',
+                       '6acf25bb0991f240c218d537', '6acf25bb78aae02b9ecde56e',
+                       '6acf25bc0991f240c218d539'),
+        })
+        self.assertEqual(len(set(self.deletes)), 10)
+        protected = {repair.MISSING, repair.REPLACEMENT, repair.OTHER_OPERATOR,
+                     *(pair[0] for pair in repair.RETAIN.values())}
+        self.assertFalse(protected.intersection(self.deletes))
+        plan = self.plan()
+        for op in plan['operations']:
+            if op['kind'] == 'delete':
+                self.assertIn(op['id'], repair.DELETE_BY_ITEM[op['sourceKey'].split(':')[0]])
+
+    def test_cross_item_rebinding_of_approved_id_is_rejected(self):
+        delivery, collection = self.deletes[0], self.deletes[5]
+        self.state['shifts']['125886:1']['shiftIds'] = [collection]
+        self.state['shifts']['125887:1']['shiftIds'] = [delivery]
+        # Even coherent rewritten identity and ownership cannot move approval.
+        for sid, key in ((delivery, '125887'), (collection, '125886')):
+            self.rows[sid]['notes'][0]['html'] = f'<p>(opportunity item #{key})</p>'
+        with self.assertRaises(app.RecoveryRequired): self.plan()
+        self.assertEqual(self.writes, [])
+
+    def test_fresh_checks_stop_deletion_on_drift_after_initial_preflight(self):
+        plan = self.plan()
+        for drift in ({'isPublished': True}, {'assignedUserIds': [91]},
+                      {'notes': [{'html': 'different source identity'}]}):
+            with self.subTest(drift=drift):
+                before_state, before_rows = copy.deepcopy(self.state), copy.deepcopy(self.rows)
+                original = self.update
+                def update_and_drift(client, payloads):
+                    result = original(client, payloads)
+                    self.rows[self.deletes[0]].update(copy.deepcopy(drift))
+                    return result
+                with patch.object(app, 'update_shifts', side_effect=update_and_drift):
+                    with self.assertRaises(app.RecoveryRequired): self.apply(plan)
+                self.assertFalse(any(kind == 'delete' for kind, _ in self.writes))
+                self.assertIn('4071', self.state['opportunity_holds'])
+                self.assertIn('125886:0', self.state['shifts'])
+                self.state, self.rows, self.writes = before_state, before_rows, []
+                app._save_state(self.state)
 
     def test_apply_preserves_staffing_manual_notes_and_repeats_without_writes(self):
         before_rows, before_state = copy.deepcopy(self.rows), copy.deepcopy(self.state)
